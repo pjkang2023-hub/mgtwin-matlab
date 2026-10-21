@@ -58,6 +58,18 @@ classdef Site
         function ids = sourceIds(obj)
             ids = [string({obj.converters.id}), string({obj.machines.id})];
         end
+        function [p, q] = stateLoads(obj, isl)
+            %STATELOADS Each load's p and q (aligned with obj.loads) in state
+            %   ISL: its own, times the state's load factor for it.
+            p = zeros(1, numel(obj.loads)); q = p;
+            for k = 1:numel(obj.loads)
+                f = 1.0;
+                if isConfigured(isl.load_factors) && isKey(isl.load_factors, obj.loads(k).id)
+                    f = isl.load_factors(obj.loads(k).id);
+                end
+                p(k) = obj.loads(k).p_mw * f; q(k) = obj.loads(k).q_mvar * f;
+            end
+        end
         function ids = openSwitchIds(obj, isl)
             %OPENSWITCHIDS The switches open in state ISL: those it opens, and
             %   the normally open ones it does not close.
@@ -153,6 +165,18 @@ classdef Site
                 for swid = [isl.open_switches, isl.closed_switches]
                     if ~ismember(swid, switch_ids)
                         problems(end+1) = sprintf("island '%s' references unknown switch '%s'", isl.id, swid); %#ok<AGROW>
+                    end
+                end
+                if isConfigured(isl.load_factors) && numEntries(isl.load_factors) > 0
+                    loadIds = string({obj.loads.id});
+                    lk = keys(isl.load_factors); lv = values(isl.load_factors);
+                    for j = 1:numel(lk)
+                        if ~ismember(lk(j), loadIds)
+                            problems(end+1) = sprintf("island '%s' scales unknown load '%s'", isl.id, lk(j)); %#ok<AGROW>
+                        end
+                        if lv(j) < 0
+                            problems(end+1) = sprintf("island '%s' scales load '%s' by a negative factor %s", isl.id, lk(j), mgtwin.internal.fmtNum(lv(j))); %#ok<AGROW>
+                        end
                     end
                 end
                 both = intersect(isl.open_switches, isl.closed_switches);

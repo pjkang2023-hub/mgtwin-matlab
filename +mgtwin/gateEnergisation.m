@@ -62,10 +62,10 @@ for k = 1:numel(site.islands)
             end
         end
         loadMva = 0;
+        [pState, qState] = site.stateLoads(isl);
         for j = 1:numel(site.loads)
-            ld = site.loads(j);
-            if ismember(ld.bus, buses)
-                loadMva = loadMva + hypot(ld.p_mw, ld.q_mvar);
+            if ismember(site.loads(j).bus, buses)
+                loadMva = loadMva + hypot(pState(j), qState(j));
             end
         end
         % the forming units already carry whatever the grid-following fleet

@@ -31,10 +31,9 @@ for k = 1:numel(site.converters)
     srcMva(end+1) = c.s_rated_mva; srcStorage(end+1) = ~isempty(c.energy_mwh); %#ok<AGROW>
 end
 loadBus = string({site.loads.bus});
-loadP = [site.loads.p_mw];
-loadQ = [site.loads.q_mvar];
+loadP = []; loadQ = [];   % the state's loads, set per island below
     function s = sLoad(mask)
-        % apparent power of the loads on the buses in MASK
+        % apparent power of the state's loads on the buses in MASK
         on = ismember(loadBus, busIds(mask));
         s = hypot(sum(loadP(on)), sum(loadQ(on)));
     end
@@ -44,6 +43,7 @@ for k = 1:numel(site.islands)
     if isl.grid_connected || isempty(isl.energized_source_ids)
         continue;
     end
+    [loadP, loadQ] = site.stateLoads(isl);
     root = mgtwin.internal.sections(site, isl);
     en = find(ismember(srcIds, isl.energized_source_ids));
     % keep the state's order of its sources

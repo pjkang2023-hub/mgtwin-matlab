@@ -38,7 +38,8 @@ for k = 1:numel(site.islands)
         nGfl = sum(~ismember(here, gfmIds));
         buses = busIds(root == r);
         label = sprintf("%s/section(%s)", isl.id, mgtwin.internal.zoneName(site, buses));
-        mw = sum([site.loads(ismember(string({site.loads.bus}), buses)).p_mw]);
+        [pState, ~] = site.stateLoads(isl);
+        mw = sum(pState(ismember(string({site.loads.bus}), buses)));
         if ~isempty(gfm)
             rep.add(Finding("forming", Severity.PASS, ...
                 sprintf("%d grid-forming source(s) %s for %d grid-following, %.1f MW load", ...

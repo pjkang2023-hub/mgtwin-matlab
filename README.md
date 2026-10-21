@@ -1,6 +1,6 @@
 # mgtwin (MATLAB)
 
-MATLAB port of `mgtwin` v0.6.9 -- staged, gated authoring of microgrid
+MATLAB port of `mgtwin` v0.6.10 -- staged, gated authoring of microgrid
 digital twins. The Python original (pydantic + numpy + scipy) is reproduced
 module for module as a MATLAB package `+mgtwin`; the design decisions,
 gate logic, identification honesty rules, unbalanced solver, fault module,
@@ -19,7 +19,7 @@ New here? Start with [TUTORIAL.md](TUTORIAL.md) and its runnable companion
 
 ```matlab
 addpath("mgtwin-matlab")            % the folder containing +mgtwin
-runtests("tests/MgtwinTest.m")      % 79 tests; the 7 Banshee ones skip without data
+runtests("tests/MgtwinTest.m")      % 80 tests; the 7 Banshee ones skip without data
 site = mgtwin.siteFromJson("examples/c003_revC_site.json");   % a Site written by Python's mgtwin
 disp(mgtwin.runAllGates(site).render())                      % all seven gates
 env = mgtwin.buildEnvelope(site); disp(env.render())         % stage 6: where the twin is valid
@@ -64,7 +64,7 @@ examples/                demo, ieee4_rung2, banshee_slg, rung4_identifiability_e
 tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
 ```
 
-## What's new since the v0.6.0 port (Python v0.6.1-v0.6.9)
+## What's new since the v0.6.0 port (Python v0.6.1-v0.6.10)
 
 * **Declared IT grounding (v0.6.1).** A `GroundingSource` of kind
   `UNGROUNDED` is a design declaration, not a zero-sequence source: its zone
@@ -147,6 +147,15 @@ tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
   (with their declared relays and Electrisim's study records), every
   protection finding, envelope render and `check` answer is identical to
   Python's.
+* **Load transfers in a state (v0.6.10).** `IslandConfig.load_factors` (a
+  `dictionary` load id -> factor; a struct, as `jsondecode` gives a JSON
+  object, is accepted) scales a load's p and q in that state - the
+  dual-corded halls' cord-A load doubling when board B is lost.
+  `Site.stateLoads` gives each state's loads, which the loading, forming and
+  energisation gates and the runner sum; a factor for an unknown load, or a
+  negative one, is refused. Load ids reach `siteFromJson` as `jsondecode`
+  field names, so an id that is not a valid MATLAB name would be mangled (the
+  C003 ids are valid).
 
 ## Conventions of the port
 

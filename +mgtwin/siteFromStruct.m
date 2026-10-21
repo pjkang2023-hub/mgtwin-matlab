@@ -40,6 +40,11 @@ nv = {};
 for f = string(fieldnames(item))'
     v = item.(f);
     if isempty(v) && ~ischar(v) && ~iscell(v), continue; end   % JSON null: the default
+    if f == "load_factors"
+        % a JSON object id -> factor: jsondecode gives a struct, its keys as field names
+        nv = [nv, {char(f), v}]; %#ok<AGROW>
+        continue
+    end
     if isfield(enums, f)
         v = mgtwin.internal.enumFromValue(enums.(f), v);
     elseif f == "params"

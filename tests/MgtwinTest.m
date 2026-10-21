@@ -917,6 +917,41 @@ classdef MgtwinTest < matlab.unittest.TestCase
             end
         end
 
+        function test_a_state_moves_load(tc)
+            % When a board is lost the dual-corded halls move to the other cord: the state says so with a
+            % load factor, and the loading gate sums the moved load - and a factor for an unknown load, or
+            % a negative one, is refused.
+            site = MgtwinTest.revcRebased();
+            i = find(string({site.islands.id}) == "MVA_BUS_FAULT");
+            ids = string({site.loads.id});
+            cb = find(contains(ids, "cordB"), 1);
+            msgs = @(s) string({MgtwinTest.scoped(mgtwin.gateLoading(s), "MVA_BUS_FAULT/loading").message});
+            before = msgs(site);
+            site.islands(i).load_factors = dictionary(ids(cb), 2.0);
+            after = msgs(site);
+            [p, q] = site.stateLoads(site.islands(i));
+            tc.verifyEqual(p(cb), 2 * site.loads(cb).p_mw);
+            tc.verifyEqual(q(cb), 2 * site.loads(cb).q_mvar);
+            tc.verifyNotEqual(before, after);
+            root = fileparts(fileparts(mfilename("fullpath")));
+            raw = jsondecode(fileread(fullfile(root, "examples", "c003_revC_site.json")));
+            j = find(cellfun(@(x) string(x.id) == "MVA_BUS_FAULT", raw.islands));
+            raw.islands{j}.load_factors = struct("NOPE", 2.0);
+            try
+                mgtwin.siteFromStruct(raw);
+                tc.verifyFail("a factor for an unknown load was accepted");
+            catch err
+                tc.verifySubstring(err.message, "scales unknown load");
+            end
+            raw.islands{j}.load_factors = struct(char(ids(cb)), -1.0);
+            try
+                mgtwin.siteFromStruct(raw);
+                tc.verifyFail("a negative factor was accepted");
+            catch err
+                tc.verifySubstring(err.message, "negative factor");
+            end
+        end
+
         function test_revc_example_matches_python_gate_counts(tc)
             % The Rev C example through all seven gates gives Python v0.6.5's
             % run_all, gate by gate and severity by severity.
