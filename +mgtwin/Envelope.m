@@ -68,7 +68,7 @@ classdef Envelope
                 out(end+1) = "state '" + state_id + "' is not enumerated in the Site: the twin says nothing about it";
             else
                 excl = st.excludedFor(ph.Value);
-                if ph == P && ~isempty(study) && study.passed
+                if ph == P && ~isempty(study) && study.passed && study.complete
                     % the study computed the fault currents the screening only bounds from ratings
                     excl = excl(~startsWith(excl, "protection:"));
                 end
@@ -105,8 +105,15 @@ classdef Envelope
                     if strlength(study.reference) > 0, ref = " (" + study.reference + ")"; end
                     if ~study.passed
                         out(end+1) = "the " + study.tool + " protection study finds this state's protection fails" + ref;
-                    elseif ~study.models_identified
-                        prov(end+1) = "studied in " + study.tool + ref + " on assumed converter current limits and ride-through";
+                    else
+                        if ~study.complete
+                            gap = "the " + study.tool + " study covers part of this state's protection only";
+                            if strlength(study.notes) > 0, gap = gap + ": " + study.notes; end
+                            prov(end+1) = gap;
+                        end
+                        if ~study.models_identified
+                            prov(end+1) = "studied in " + study.tool + ref + " on assumed converter current limits and ride-through";
+                        end
                     end
                 elseif ph == P
                     assumed = st.sources(ismember(st.sources, obj.ride_through_assumed));
@@ -165,8 +172,8 @@ classdef Envelope
             studies = struct();
             for k = 1:numel(obj.protection_studies)
                 r = obj.protection_studies(k);
-                studies.(r.state_id) = struct("tool", r.tool, "passed", r.passed, ...
-                    "models_identified", r.models_identified, "reference", r.reference);
+                studies.(r.state_id) = struct("tool", r.tool, "passed", r.passed, "complete", r.complete, ...
+                    "models_identified", r.models_identified, "reference", r.reference, "notes", r.notes);
             end
             s = struct("site_id", obj.site_id, "mgtwin_version", obj.version, "phenomena", ph, ...
                 "site_wide_fails", {cellstr(obj.site_wide_fails)}, "states", sts, "identifications", ids, ...
@@ -210,11 +217,13 @@ classdef Envelope
                 L(end+1) = "- current limit / ride-through assumed: " + strjoin(obj.ride_through_assumed, ", ");
             end
             if ~isempty(obj.protection_studies)
-                L = [L, "", "## Protection studies", "", "| State | Tool | Verdict | Models | Reference |", "|---|---|---|---|---|"];
+                L = [L, "", "## Protection studies", "", "| State | Tool | Verdict | Coverage | Models | Reference |", ...
+                     "|---|---|---|---|---|---|"];
                 for r = obj.protection_studies
                     if r.passed, v = "passed"; else, v = "FAILS"; end
+                    if r.complete, c = "complete"; else, c = "partial"; end
                     if r.models_identified, m = "identified"; else, m = "assumed"; end
-                    L(end+1) = "| " + r.state_id + " | " + r.tool + " | " + v + " | " + m + " | " + r.reference + " |"; %#ok<AGROW>
+                    L(end+1) = "| " + r.state_id + " | " + r.tool + " | " + v + " | " + c + " | " + m + " | " + r.reference + " |"; %#ok<AGROW>
                 end
             end
             if ~isempty(obj.undeclared)

@@ -15,11 +15,16 @@ function rep = gateProtection(site)
 %     * every phase overcurrent element with a pickup (50, 51, 67) against
 %       the available fault current, with the dependability margin;
 %     * converter-dominated states: the breakers whose primary protection
-%       rests on magnitude alone (no 87, 21 or 51V element) are named in a
-%       WARN;
-%     * a breaker that fault current reaches from both sides (energised
-%       sources on each) with only non-directional overcurrent sees
-%       through-faults: WARN, it needs direction (67) or unit protection.
+%       rests on magnitude alone (no 21 or 51V element, and no unit element
+%       whose zones cover both sides of the breaker) are named in a WARN;
+%     * a breaker fed from both sides with only non-directional overcurrent
+%       sees the through-faults the far side can drive: phase, when that
+%       side's fault contribution exceeds the margin times its rating (a
+%       machine's, not a converter's 1.1-1.5 pu); earth, when each side has
+%       an earthing source. WARN, it needs direction (67 / 67N) or unit
+%       protection;
+%     * phase elements whose pickup is not yet set are named, not screened
+%       (WARN).
 %   Earth-fault elements are not screened: their current is the
 %   zero-sequence path's. Screening only - grading, settings and fault
 %   levels are a protection study's (Electrisim), whose results the
@@ -36,6 +41,7 @@ CONVERTER_DOMINANCE = mgtwin.gateProtectionConstants().CONVERTER_DOMINANCE;
 PHASE_OC = mgtwin.ProtectionFunction.PHASE_OC;
 EARTH_OC = mgtwin.ProtectionFunction.EARTH_OC;
 NOT_MAGNITUDE = mgtwin.ProtectionFunction.NOT_MAGNITUDE;
+UNIT = mgtwin.ProtectionFunction.UNIT;
 LEGACY = mgtwin.ProtectionFunction.LEGACY_ELEMENT;
 
 if isempty(site.relays)
@@ -76,6 +82,7 @@ for k = 1:numel(site.islands)
     % elements with a pickup to screen, in relay order
     ocRelay = mgtwin.OvercurrentRelay.empty(1,0);
     ocElem = mgtwin.ProtectionFunction.empty(1,0);
+    unset = string.empty(1,0);
     for j = 1:numel(inService)
         r = inService(j);
         act = r.active(group);
@@ -90,8 +97,17 @@ for k = 1:numel(site.islands)
             if ismember(e.ansi, PHASE_OC) && ~isempty(e.pickup_a)
                 ocRelay(end+1) = r; %#ok<AGROW>
                 ocElem(end+1) = e; %#ok<AGROW>
+            elseif ismember(e.ansi, PHASE_OC)
+                unset(end+1) = r.id + " " + e.ansi; %#ok<AGROW>
             end
         end
+    end
+    if ~isempty(unset)
+        msg = sprintf("%d phase overcurrent element(s) with no pickup set are not screened: ", numel(unset)) + ...
+            strjoin(unset(1:min(8, end)), ", ");
+        if numel(unset) > 8, msg = msg + sprintf(" and %d more", numel(unset) - 8); end
+        rep.add(Finding("protection", Severity.WARN, msg, isl.id + "/unset", ...
+            "Declare the settings once the setting study has them (pickup in primary amperes)."));
     end
 
     for j = 1:numel(ocElem)
@@ -123,10 +139,16 @@ for k = 1:numel(site.islands)
     for j = 1:numel(inService)
         if ~isempty(inService(j).active(group)), protectedRelays(end+1) = inService(j); end %#ok<AGROW>
     end
+    swIds = string({site.switches.id});
+    % A unit element protects the breaker's circuit only if its zones take in
+    % both sides of the breaker (a feeder's 87L, a bus section between two
+    % 87B zones) - not a board's 87B on a breaker leaving it.
+    unitCovers = @(r, act) unitZoneCovers(site.switches(swIds == r.switch_id), act, UNIT);
     magnitudeOnly = string.empty(1,0);
     for j = 1:numel(protectedRelays)
         act = protectedRelays(j).active(group);
-        if ~any(ismember(string({act.ansi}), NOT_MAGNITUDE))
+        if ~unitCovers(protectedRelays(j), act) && ...
+                ~any(ismember(string({act.ansi}), setdiff(NOT_MAGNITUDE, UNIT, "stable")))
             magnitudeOnly(end+1) = protectedRelays(j).id; %#ok<AGROW>
         end
     end
@@ -148,18 +170,45 @@ for k = 1:numel(site.islands)
             "that does not rest on magnitude alone", 100 * share), isl.id));
     end
 
-    % Breakers fed from both sides: non-directional overcurrent sees through-faults.
-    srcIds = [string({site.machines.id}), string({site.converters.id})];
-    srcBus = [string({site.machines.bus}), string({site.converters.bus})];
-    energized = isl.energized_source_ids;
+    % Breakers fed from both sides: non-directional overcurrent sees a
+    % through-fault the far side can drive. Phase: the far side's fault
+    % contribution above PROTECTION_MARGIN x its rated current (a synchronous
+    % machine's 1/x''; a converter's 1.1-1.5 pu is not - a pickup above its
+    % load with margin does not see it). Earth: an earthing source on each
+    % side at the breaker's voltage. Unless a 67 / 67N or a unit element
+    % covering the breaker's circuit is there.
+    srcs = arrayfun(@(sid) {site.source(sid)}, isl.energized_source_ids);
+    busKv = [site.buses.v_nom_kv];
+    earths = string.empty(1,0);
+    for g = site.grounding(:)'
+        if g.kind ~= mgtwin.GroundingKind.UNGROUNDED && g.available_when_islanded
+            earths(end+1) = g.bus; %#ok<AGROW>
+        end
+    end
+    for tx = site.transformers(:)'
+        if tx.providesZeroSequencePathTo("hv"), earths(end+1) = tx.hv_bus; end %#ok<AGROW>
+        if tx.providesZeroSequencePathTo("lv"), earths(end+1) = tx.lv_bus; end %#ok<AGROW>
+    end
+    iRated = @(mva) mva * 1e6 / (sqrt(3) * site.base.v_base_kv * 1e3);
+    lowRatio = string.empty(1,0);
     for j = 1:numel(protectedRelays)
         r = protectedRelays(j);
         act = r.active(group);
+        unit = unitCovers(r, act);
         ansis = string({act.ansi});
-        if any(arrayfun(@(e) e.isDirectional(), act)) || ~any(ismember(ansis, [PHASE_OC, EARTH_OC]))
+        dirs = arrayfun(@(e) e.isDirectional(), act);
+        blind = string.empty(1,0);
+        kinds = {"phase", PHASE_OC; "earth", EARTH_OC};
+        for q = 1:2
+            inK = ismember(ansis, kinds{q, 2});
+            if ~unit && any(inK & ~dirs) && ~any(inK & dirs)
+                blind(end+1) = kinds{q, 1}; %#ok<AGROW>
+            end
+        end
+        if isempty(blind)
             continue;
         end
-        sw = site.switches(string({site.switches.id}) == r.switch_id);
+        sw = site.switches(swIds == r.switch_id);
         if sw.from_bus == sw.to_bus
             continue;
         end
@@ -169,19 +218,65 @@ for k = 1:numel(site.islands)
         if ends(1) == ends(2)
             continue;
         end
-        fed = false(1, 2);
-        for s_ = energized
-            m = find(srcIds == s_, 1);
-            if isempty(m), continue; end
-            fed = fed | (rootOf(srcBus(m)) == ends);
+        seen = string.empty(1,0);
+        seenKinds = string.empty(1,0);
+        if ismember("phase", blind)
+            ratios = zeros(1, 2);
+            for q = 1:2
+                fault = 0; mva = 0;
+                for m = 1:numel(srcs)
+                    x = srcs{m};
+                    if rootOf(x.bus) == ends(q)
+                        fault = fault + x.faultContributionA(site.base);
+                        mva = mva + x.s_rated_mva;
+                    end
+                end
+                if mva > 0, ratios(q) = fault / iRated(mva); end
+            end
+            if min(ratios) > 0 && max(ratios) > PROTECTION_MARGIN
+                seen(end+1) = sprintf("phase (the far side gives %.1fx its rated current)", max(ratios)); %#ok<AGROW>
+                seenKinds(end+1) = "phase"; %#ok<AGROW>
+            elseif min(ratios) > 0
+                lowRatio(end+1) = r.switch_id; %#ok<AGROW>
+            end
         end
-        if all(fed)
+        if ismember("earth", blind)
+            kv0 = busKv(busIds == sw.from_bus);
+            atKv = earths(arrayfun(@(b) any(busIds == b) && abs(busKv(busIds == b) - kv0) < 1e-6, earths));
+            eachSide = true;
+            for q = 1:2
+                eachSide = eachSide && any(arrayfun(@(b) rootOf(b) == ends(q), atKv));
+            end
+            if eachSide
+                seen(end+1) = "earth (an earthing source on each side)"; %#ok<AGROW>
+                seenKinds(end+1) = "earth"; %#ok<AGROW>
+            end
+        end
+        if ~isempty(seen)
+            codes = replace(replace(seenKinds, "phase", "67"), "earth", "67N");
             rep.add(Finding("protection", Severity.WARN, ...
-                sprintf("fault current reaches breaker %s from both sides (energised sources on each); " + ...
-                "relay %s's non-directional overcurrent sees through-faults", r.switch_id, r.id), ...
+                sprintf("breaker %s is fed from both sides; relay %s's non-directional overcurrent " + ...
+                "sees through-faults: %s", r.switch_id, r.id, strjoin(seen, "; ")), ...
                 isl.id + "/" + r.id, ...
-                "Add a directional element (67 / 67N) or unit protection (87L) on this breaker."));
+                "Add a directional element (" + strjoin(codes, " / ") + ") or unit protection (87L) on this breaker."));
         end
     end
+    if ~isempty(lowRatio)
+        msg = sprintf("%d breaker(s) fed from both sides by converters only, whose fault current is within " + ...
+            "%gx their rating: a phase pickup above load with margin does not see the through-fault (", ...
+            numel(lowRatio), PROTECTION_MARGIN) + strjoin(lowRatio(1:min(6, end)), ", ");
+        if numel(lowRatio) > 6, msg = msg + " ..."; end
+        rep.add(Finding("protection", Severity.PASS, msg + ")", isl.id + "/through-faults"));
+    end
 end
+end
+
+
+function tf = unitZoneCovers(sw, act, UNIT)
+%UNITZONECOVERS The union of the unit elements' zones takes in both ends of SW.
+zone = string.empty(1,0);
+for e = act
+    if ismember(e.ansi, UNIT), zone = [zone, reshape(e.zone_buses, 1, [])]; end %#ok<AGROW>
+end
+tf = all(ismember([sw.from_bus, sw.to_bus], zone));
 end

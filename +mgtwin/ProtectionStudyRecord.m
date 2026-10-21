@@ -4,7 +4,9 @@ classdef ProtectionStudyRecord
     %   levels at each relay, grading, settings). PASSED is the study's own
     %   conclusion; MODELS_IDENTIFIED says whether its converter current
     %   limits and ride-through were identified from measured response or the
-    %   vendors' assumed models.
+    %   vendors' assumed models; COMPLETE false when it covered only part of
+    %   the state's protection (NOTES says what not) - a pass then stands for
+    %   what it covered, and the state stays PROVISIONAL.
     properties
         state_id (1,1) string = ""
         tool (1,1) string = ""
@@ -12,6 +14,7 @@ classdef ProtectionStudyRecord
         models_identified (1,1) logical = false
         reference (1,1) string = ""
         notes (1,1) string = ""
+        complete (1,1) logical = true
     end
     methods
         function obj = ProtectionStudyRecord(opts)
@@ -22,6 +25,7 @@ classdef ProtectionStudyRecord
                 opts.models_identified (1,1) logical = false
                 opts.reference (1,1) string = ""
                 opts.notes (1,1) string = ""
+                opts.complete (1,1) logical = true
             end
             if mgtwin.internal.requireFields(opts, ["state_id", "tool", "passed"], "ProtectionStudyRecord"), return; end
             for f = string(fieldnames(opts))'

@@ -1,6 +1,6 @@
 # mgtwin (MATLAB)
 
-MATLAB port of `mgtwin` v0.6.8 -- staged, gated authoring of microgrid
+MATLAB port of `mgtwin` v0.6.9 -- staged, gated authoring of microgrid
 digital twins. The Python original (pydantic + numpy + scipy) is reproduced
 module for module as a MATLAB package `+mgtwin`; the design decisions,
 gate logic, identification honesty rules, unbalanced solver, fault module,
@@ -19,7 +19,7 @@ New here? Start with [TUTORIAL.md](TUTORIAL.md) and its runnable companion
 
 ```matlab
 addpath("mgtwin-matlab")            % the folder containing +mgtwin
-runtests("tests/MgtwinTest.m")      % 76 tests; the 7 Banshee ones skip without data
+runtests("tests/MgtwinTest.m")      % 79 tests; the 7 Banshee ones skip without data
 site = mgtwin.siteFromJson("examples/c003_revC_site.json");   % a Site written by Python's mgtwin
 disp(mgtwin.runAllGates(site).render())                      % all seven gates
 env = mgtwin.buildEnvelope(site); disp(env.render())         % stage 6: where the twin is valid
@@ -64,7 +64,7 @@ examples/                demo, ieee4_rung2, banshee_slg, rung4_identifiability_e
 tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
 ```
 
-## What's new since the v0.6.0 port (Python v0.6.1-v0.6.8)
+## What's new since the v0.6.0 port (Python v0.6.1-v0.6.9)
 
 * **Declared IT grounding (v0.6.1).** A `GroundingSource` of kind
   `UNGROUNDED` is a design declaration, not a zero-sequence source: its zone
@@ -130,6 +130,23 @@ tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
   identical to Python's - including the three feeder heads fed back by the
   other feeders' DER in ISL_ALL. `mgtwin.version()` gives the Python release
   the port is at parity with.
+* **Protection screening refined (v0.6.9).** A unit element counts for a
+  breaker only when its zones take in both sides of it (a feeder's 87L, a
+  bus section between two 87B zones) - not a board's 87B on a breaker
+  leaving the board. The both-sides check is judged for phase and earth
+  apart: phase, when the far side's fault contribution exceeds the 1.5x
+  margin over its rating (a machine's 1/x'', not a converter's 1.1-1.5 pu -
+  those breakers are counted in one PASS per state, scope
+  `STATE/through-faults`); earth, when each side has an earthing source.
+  Phase elements without a pickup are named in one WARN per state (scope
+  `STATE/unset`); `OvercurrentRelay.ct_ratio` may be left `[]`. A
+  `ProtectionStudyRecord` carries `complete` (default true): a partial study
+  keeps its state PROVISIONAL and says what it left out, and only a passed,
+  complete study lifts a protection-gate FAIL; `loadProtectionStudies` skips
+  fields it does not know. On Banshee and on the two corrected C003 Sites
+  (with their declared relays and Electrisim's study records), every
+  protection finding, envelope render and `check` answer is identical to
+  Python's.
 
 ## Conventions of the port
 

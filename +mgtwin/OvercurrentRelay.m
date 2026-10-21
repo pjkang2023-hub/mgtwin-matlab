@@ -10,7 +10,7 @@ classdef OvercurrentRelay
     properties
         id (1,1) string = ""
         switch_id (1,1) string = ""
-        ct_ratio (1,1) double = NaN     % e.g. 600.0 for 600:5
+        ct_ratio double = []            % e.g. 600.0 for 600:5; [] until the design declares it
         pickup_a double = []            % primary amperes; [] = no legacy element
         curve (1,1) string = "IEC-VI"
         time_dial double = []
@@ -23,7 +23,7 @@ classdef OvercurrentRelay
             arguments
                 opts.id (1,1) string
                 opts.switch_id (1,1) string
-                opts.ct_ratio (1,1) double {mustBePositive}
+                opts.ct_ratio double {mustBeScalarOrEmpty, mustBePositive} = []
                 opts.pickup_a double {mustBeScalarOrEmpty, mustBePositive} = []
                 opts.curve (1,1) string = "IEC-VI"
                 opts.time_dial double {mustBeScalarOrEmpty, mustBePositive} = []
@@ -31,7 +31,7 @@ classdef OvercurrentRelay
                 opts.functions (1,:) mgtwin.ProtectionFunction = mgtwin.ProtectionFunction.empty(1,0)
                 opts.notes (1,1) string = ""
             end
-            if mgtwin.internal.requireFields(opts, ["id", "switch_id", "ct_ratio"], "OvercurrentRelay"), return; end
+            if mgtwin.internal.requireFields(opts, ["id", "switch_id"], "OvercurrentRelay"), return; end
             for f = string(fieldnames(opts))'
                 obj.(f) = opts.(f);
             end

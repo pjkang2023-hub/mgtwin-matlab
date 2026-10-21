@@ -59,22 +59,37 @@ classdef MgtwinTest < matlab.unittest.TestCase
             for k = 1:numel(s.transformers), s.transformers(k).x_pu = 0.06; end
         end
 
-        function s = twoBessSite(functions, pickup_a, state_group)
+        function s = twoBessSite(functions, pickup_a, state_group, opts)
             % Two 5 MVA grid-forming BESS on B1 and B2, tied by breaker SW; its relay carries FUNCTIONS.
+            % GENSET puts a 1 MVA machine (x'' 0.15: 6.7x its rated current into a fault) on B2 beside
+            % BESS2; EARTHED a low-resistance earthing source on each bus.
             arguments
                 functions (1,:) mgtwin.ProtectionFunction = mgtwin.ProtectionFunction.empty(1,0)
                 pickup_a double = []
                 state_group (1,1) string = "A"
+                opts.genset (1,1) logical = false
+                opts.earthed (1,1) logical = false
             end
             bess = @(i, b) mgtwin.Converter(id=i, bus=b, s_rated_mva=5.0, control=mgtwin.ConverterControl.GFM_DROOP, ...
                 params=mgtwin.ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2));
-            s = mgtwin.Site(id="T", base=mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0), ...
-                buses=[mgtwin.Bus(id="B1", v_nom_kv=11.0); mgtwin.Bus(id="B2", v_nom_kv=11.0)], ...
-                converters=[bess("BESS1", "B1"); bess("BESS2", "B2")], ...
-                switches=mgtwin.Switch(id="SW", from_bus="B1", to_bus="B2"), ...
-                relays=mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a, functions=functions), ...
-                islands=mgtwin.IslandConfig(id="I1", grid_connected=false, settings_group=state_group, ...
-                    energized_source_ids=["BESS1", "BESS2"]));
+            args = {"id", "T", "base", mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0), ...
+                "buses", [mgtwin.Bus(id="B1", v_nom_kv=11.0); mgtwin.Bus(id="B2", v_nom_kv=11.0)], ...
+                "converters", [bess("BESS1", "B1"); bess("BESS2", "B2")], ...
+                "switches", mgtwin.Switch(id="SW", from_bus="B1", to_bus="B2"), ...
+                "relays", mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a, functions=functions)};
+            energized = ["BESS1", "BESS2"];
+            if opts.genset
+                args = [args, {"machines", mgtwin.SynchronousGen(id="GEN", bus="B2", s_rated_mva=1.0, h_sec=1.0, xd_subtransient_pu=0.15)}];
+                energized(end+1) = "GEN";
+            end
+            if opts.earthed
+                args = [args, {"grounding", [ ...
+                    mgtwin.GroundingSource(id="GB1", bus="B1", kind=mgtwin.GroundingKind.LOW_RESISTANCE, z0_ohm=20.0, available_when_islanded=true); ...
+                    mgtwin.GroundingSource(id="GB2", bus="B2", kind=mgtwin.GroundingKind.LOW_RESISTANCE, z0_ohm=20.0, available_when_islanded=true)]}];
+            end
+            args = [args, {"islands", mgtwin.IslandConfig(id="I1", grid_connected=false, settings_group=state_group, ...
+                energized_source_ids=energized)}];
+            s = mgtwin.Site(args{:});
         end
 
         function rules = revcRules()
@@ -1077,14 +1092,86 @@ classdef MgtwinTest < matlab.unittest.TestCase
         end
 
         function test_protection_gate_wants_direction_both_sides(tc)
-            % BESS on each side of SW: a non-directional 51 sees through-faults;
-            % a 67 or an 87L does not need the WARN.
-            bothSides = @(rep) MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.WARN), "from both sides");
-            tc.verifyTrue(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite(mgtwin.ProtectionFunction.empty(1,0), 150.0))));
-            tc.verifyFalse(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
-                mgtwin.ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward")))));
-            tc.verifyFalse(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
-                mgtwin.ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"]), 150.0))));
+            % A genset beside BESS2 drives 6.7x its rating through SW into a
+            % fault on B1: a non-directional 51 sees the through-fault; a 67 or
+            % an 87L does not need the WARN. With converters alone on each side
+            % the through-fault is within 1.5x their rating - a pickup above load
+            % does not see it, and the gate says so in one PASS.
+            none = mgtwin.ProtectionFunction.empty(1,0);
+            function f = bothSides(rep)
+                f = rep.bySeverity(mgtwin.Severity.WARN);
+                f = f(contains(string({f.message}), "from both sides"));
+            end
+            w = bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite(none, 150.0, genset=true)));
+            tc.verifyNumElements(w, 1);
+            tc.verifySubstring(w.message, "the far side gives 2.1x its rated current");   % (5 x 1.2 + 1 / 0.15) / 6 MVA
+            tc.verifyEmpty(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
+                mgtwin.ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward"), [], "A", genset=true))));
+            tc.verifyEmpty(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
+                mgtwin.ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"]), 150.0, "A", genset=true))));
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(none, 150.0));
+            tc.verifyEmpty(bothSides(rep));
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.PASS), "fed from both sides by converters only"));
+        end
+
+        function test_direction_screened_for_phase_and_earth_apart(tc)
+            % A 67N covers earth through-faults, not phase ones: 51 + 67N on a
+            % breaker fed from both sides still wants a 67 for phase faults; 67 +
+            % 51N wants a 67N; 67 + 67N or an 87L wants nothing. Unset phase
+            % pickups are named.
+            PF = @(varargin) mgtwin.ProtectionFunction(varargin{:});
+            function w = warns(fns)
+                rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(fns, [], "A", genset=true, earthed=true));
+                f = rep.bySeverity(mgtwin.Severity.WARN);
+                f = f(contains(string({f.message}), "from both sides"));
+                w = string({f.message}) + " | " + string({f.remedy});
+            end
+            w = warns([PF("ansi", "51", "pickup_a", 150.0), PF("ansi", "67N", "pickup_a", 40.0, "direction", "forward")]);
+            tc.verifyNumElements(w, 1); tc.verifySubstring(w, "sees through-faults: phase"); tc.verifySubstring(w, "(67)");
+            w = warns([PF("ansi", "67", "pickup_a", 150.0, "direction", "forward"), PF("ansi", "51N", "pickup_a", 40.0)]);
+            tc.verifyNumElements(w, 1); tc.verifySubstring(w, "sees through-faults: earth"); tc.verifySubstring(w, "(67N)");
+            tc.verifyEmpty(warns([PF("ansi", "67", "pickup_a", 150.0, "direction", "forward"), ...
+                PF("ansi", "67N", "pickup_a", 40.0, "direction", "forward")]));
+            tc.verifyEmpty(warns([PF("ansi", "51", "pickup_a", 150.0), PF("ansi", "87L", "zone_buses", ["B1", "B2"])]));
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite([PF("ansi", "51"), PF("ansi", "67N", "direction", "forward")]));
+            u = rep.findings(string({rep.findings.scope}) == "I1/unset");
+            tc.verifyNumElements(u, 1); tc.verifyEqual(u.severity, mgtwin.Severity.WARN);
+            tc.verifySubstring(u.message, "1 phase overcurrent element(s) with no pickup set are not screened: R 51");
+        end
+
+        function test_board_87B_does_not_protect_the_circuit_leaving_it(tc)
+            % 87B on a breaker's board covers one side of it: the circuit beyond
+            % still rests on its overcurrent (named in the converter-dominance
+            % WARN, and fed from both sides it wants direction). Zones on both
+            % sides - an 87L, or a bus section between two 87B zones - cover it.
+            PF = @(varargin) mgtwin.ProtectionFunction(varargin{:});
+            function [mag, both] = screen(fns)
+                m = mgtwin.gateProtection(MgtwinTest.twoBessSite(fns));
+                b = mgtwin.gateProtection(MgtwinTest.twoBessSite(fns, [], "A", genset=true));
+                mag = MgtwinTest.anyMessageContains(m.bySeverity(mgtwin.Severity.WARN), "rests on magnitude at R");
+                both = MgtwinTest.anyMessageContains(b.bySeverity(mgtwin.Severity.WARN), "from both sides");
+            end
+            [mag, both] = screen([PF("ansi", "51", "pickup_a", 150.0), PF("ansi", "87B", "zone_buses", "B1")]);
+            tc.verifyTrue(mag); tc.verifyTrue(both);
+            [mag, both] = screen([PF("ansi", "51", "pickup_a", 150.0), PF("ansi", "87B", "zone_buses", "B1"), ...
+                PF("ansi", "87B", "zone_buses", "B2")]);
+            tc.verifyFalse(mag); tc.verifyFalse(both);
+        end
+
+        function test_envelope_partial_study_stays_provisional(tc)
+            % A study that passed the cables it could compute but not the bus
+            % breakers: provisional, naming the gap, even on identified models;
+            % a partial study that finds a failure still puts the state outside.
+            site = MgtwinTest.revcRebased();
+            env = mgtwin.buildEnvelope(site, protection_studies=[ ...
+                mgtwin.ProtectionStudyRecord(state_id="N1_PCS", tool="Electrisim", passed=true, models_identified=true, ...
+                    complete=false, notes="bus-coupler breakers not studied"), ...
+                mgtwin.ProtectionStudyRecord(state_id="NORMAL", tool="Electrisim", passed=false, complete=false)]);
+            [v, why] = env.check("N1_PCS", "protection");
+            tc.verifyEqual(v, mgtwin.Inside.PROVISIONAL);
+            tc.verifyEqual(why, "the Electrisim study covers part of this state's protection only: bus-coupler breakers not studied");
+            tc.verifyEqual(env.check("NORMAL", "protection"), mgtwin.Inside.OUTSIDE);
+            tc.verifySubstring(env.render(), "| partial |");
         end
 
         function test_envelope_takes_protection_studies(tc)
@@ -1118,8 +1205,9 @@ classdef MgtwinTest < matlab.unittest.TestCase
         end
 
         function test_protection_findings_match_python_on_banshee(tc)
-            % gateProtection on Banshee gives Python v0.6.8's findings exactly:
-            % 13, with the three feeder heads fed from both sides in ISL_ALL.
+            % gateProtection on Banshee gives Python v0.6.9's findings exactly:
+            % 13, with the three feeder heads fed from both sides in ISL_ALL -
+            % the diesel on another feeder drives 5.6-6.7x its rating back.
             tc.assumeBanshee();
             P = banshee_paths();
             site = mgtwin.composeBanshee(P.CASE_V5, relay_dir=P.RELAYS, mdl_path=P.MDL);
@@ -1127,6 +1215,9 @@ classdef MgtwinTest < matlab.unittest.TestCase
             tc.verifyNumElements(rep.findings, 13);
             both = rep.findings(contains(string({rep.findings.message}), "from both sides"));
             tc.verifyEqual(string({both.scope}), ["ISL_ALL/R_F1_HEAD", "ISL_ALL/R_F2_HEAD", "ISL_ALL/R_F3_HEAD"]);
+            tc.verifyEqual(both(1).message, "breaker SW_F1 is fed from both sides; relay R_F1_HEAD's non-directional " + ...
+                "overcurrent sees through-faults: phase (the far side gives 6.7x its rated current)");
+            tc.verifyEqual(both(1).remedy, "Add a directional element (67) or unit protection (87L) on this breaker.");
             f = rep.findings(string({rep.findings.scope}) == "ISL_F3/R_F2_HEAD");
             tc.verifyEqual(f.message, "fault current 581 A gives only 1.23x pickup, below the 1.5x dependability margin; operating time will be very long");
         end
