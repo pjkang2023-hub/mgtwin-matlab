@@ -1,6 +1,7 @@
-function root = sections(site, isl, without)
+function root = sections(site, isl, without, open_extra)
 %SECTIONS Electrical sections of state ISL: union-find over its closed
-%   switches, branches and transformers (less the transformer ids WITHOUT).
+%   switches (less the switch ids OPEN_EXTRA), branches and transformers
+%   (less the transformer ids WITHOUT).
 %
 %   A switch open in the state (Site.openSwitchIds) severs every edge between
 %   its two buses, as a breaker in series with whatever it switches does.
@@ -10,11 +11,12 @@ arguments
     site (1,1) mgtwin.Site
     isl (1,1) mgtwin.IslandConfig
     without (1,:) string = string.empty(1,0)
+    open_extra (1,:) string = string.empty(1,0)
 end
 busIds = site.busIds();
 n = numel(busIds);
 idx = dictionary(busIds, 1:n);
-opened = site.openSwitchIds(isl);
+opened = unique([site.openSwitchIds(isl), open_extra]);
 
 openKeys = string.empty(1,0);
 for k = 1:numel(site.switches)

@@ -1,6 +1,6 @@
 # mgtwin (MATLAB)
 
-MATLAB port of `mgtwin` v0.6.5 -- staged, gated authoring of microgrid
+MATLAB port of `mgtwin` v0.6.8 -- staged, gated authoring of microgrid
 digital twins. The Python original (pydantic + numpy + scipy) is reproduced
 module for module as a MATLAB package `+mgtwin`; the design decisions,
 gate logic, identification honesty rules, unbalanced solver, fault module,
@@ -19,9 +19,11 @@ New here? Start with [TUTORIAL.md](TUTORIAL.md) and its runnable companion
 
 ```matlab
 addpath("mgtwin-matlab")            % the folder containing +mgtwin
-runtests("tests/MgtwinTest.m")      % 63 tests; the 6 Banshee ones skip without data
+runtests("tests/MgtwinTest.m")      % 76 tests; the 7 Banshee ones skip without data
 site = mgtwin.siteFromJson("examples/c003_revC_site.json");   % a Site written by Python's mgtwin
 disp(mgtwin.runAllGates(site).render())                      % all seven gates
+env = mgtwin.buildEnvelope(site); disp(env.render())         % stage 6: where the twin is valid
+[v, why] = env.check("NORMAL", "frequency", step_pu=0.3)     % INSIDE / PROVISIONAL / OUTSIDE + reasons
 cd examples; demo                   % gates + identification A/B/C/D
 ieee4_rung2                          % rung 2: IEEE 4-node verification
 banshee_slg                          % rung 2: SLG grounding design triangle
@@ -62,7 +64,7 @@ examples/                demo, ieee4_rung2, banshee_slg, rung4_identifiability_e
 tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
 ```
 
-## What's new since the v0.6.0 port (Python v0.6.1-v0.6.5)
+## What's new since the v0.6.0 port (Python v0.6.1-v0.6.8)
 
 * **Declared IT grounding (v0.6.1).** A `GroundingSource` of kind
   `UNGROUNDED` is a design declaration, not a zero-sequence source: its zone
@@ -95,6 +97,39 @@ tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
   `mgtwin.transformerPairing` lists the pairs for review. Three branches
   match no instance (TX_30_40, TX_80_110, TX_50_60, 32-51 % apart) and take
   their class's remaining unit. Pairs identical to Python's.
+* **Stage 1, tag ingest (v0.6.6).** `mgtwin.ingestTags(tags, rules)` maps a
+  SCADA/historian tag list (`mgtwin.readTags`, CSV) to canonical entities and
+  measurements through the site's own naming rules (`mgtwin.TagRule`, or
+  `mgtwin.loadRules` from JSON; Python's `(?P<name>...)` tokens accepted, and
+  like `re.match` a pattern matches from the tag's start). Every tag is
+  MATCHED / UNMATCHED / AMBIGUOUS / DUPLICATE, units are checked and scaled;
+  `mgtwin.compareWithSite` reports telemetry without equipment, equipment
+  without telemetry, and sources that cannot be identified from operating
+  data. On the parity set the render, every tag result and every comparison
+  finding are identical to Python's.
+* **Stage 6, the validity envelope (v0.6.6, v0.6.8).** `mgtwin.buildEnvelope`
+  declares where the twin is valid; `Envelope.check(state, phenomenon,
+  load_mva=, step_pu=)` answers `mgtwin.Inside` INSIDE / PROVISIONAL /
+  OUTSIDE with the reasons; `render` (Markdown) and `toJson` give the
+  artifact. `mgtwin.IdentificationRecord` bounds steps to the identified
+  amplitudes; `mgtwin.ProtectionStudyRecord` (`mgtwin.loadProtectionStudies`,
+  JSON) lets a protection study (Electrisim) supersede the screening for
+  the states it covers. On Rev C - as given, rebased, and with records and
+  studies - three renders and 48 check answers are identical to Python's.
+* **Protection functions and settings groups (v0.6.8).** A relay carries a
+  list of `mgtwin.ProtectionFunction`s (ANSI code, primary-amp pickup,
+  direction, curve, settings groups, unit-protection zone buses; a 67 needs
+  a direction, an 87 its zone); the legacy pickup fields still declare one
+  51 / 67 element active in every group. `IslandConfig.settings_group`
+  (default "A") picks the group a state runs. `gateProtection` screens, on
+  the elements active in that group: breakers with nothing active (FAIL),
+  phase pickups against converter-limited fault current (FAIL), breakers
+  whose primary protection rests on magnitude alone in converter-dominated
+  states (WARN, PASS when none), and breakers fed from both sides with only
+  non-directional overcurrent (WARN). On Banshee its 13 findings are
+  identical to Python's - including the three feeder heads fed back by the
+  other feeders' DER in ISL_ALL. `mgtwin.version()` gives the Python release
+  the port is at parity with.
 
 ## Conventions of the port
 

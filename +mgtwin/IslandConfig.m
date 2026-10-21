@@ -9,12 +9,15 @@ classdef IslandConfig
     %   switched in SIMULTANEOUSLY in this state (one ATS step, one black-start
     %   step); the energisation gate checks their summed inrush against the
     %   grid-forming current headroom of the section they land in.
+    %   settings_group names the protection settings group the relays run in
+    %   this state (black start, islanded and grid-connected states differ).
     properties
         id (1,1) string = ""
         description (1,1) string = ""
         open_switches (1,:) string = string.empty(1,0)
         closed_switches (1,:) string = string.empty(1,0)
         grid_connected (1,1) logical = false
+        settings_group (1,1) string = "A"   % protection settings group the relays run in this state
         energized_source_ids (1,:) string = string.empty(1,0)
         energise_transformer_ids (1,:) string = string.empty(1,0)
     end
@@ -26,6 +29,7 @@ classdef IslandConfig
                 opts.open_switches (1,:) string = string.empty(1,0)
                 opts.closed_switches (1,:) string = string.empty(1,0)
                 opts.grid_connected (1,1) logical
+                opts.settings_group (1,1) string = "A"
                 opts.energized_source_ids (1,:) string = string.empty(1,0)
                 opts.energise_transformer_ids (1,:) string = string.empty(1,0)
             end

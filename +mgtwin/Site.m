@@ -136,6 +136,11 @@ classdef Site
                 if ~ismember(r.switch_id, switch_ids)
                     problems(end+1) = sprintf("relay '%s' references unknown switch '%s'", r.id, r.switch_id); %#ok<AGROW>
                 end
+                for j = 1:numel(r.functions)
+                    for b = r.functions(j).zone_buses
+                        need(b, sprintf("relay '%s' %s zone", r.id, r.functions(j).ansi));
+                    end
+                end
             end
             srcs = obj.sourceIds();
             for k = 1:numel(obj.islands)

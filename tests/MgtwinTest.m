@@ -53,6 +53,57 @@ classdef MgtwinTest < matlab.unittest.TestCase
             end
         end
 
+        function s = revcRebased()
+            % Rev C with every transformer reactance on its own rating (the units gate clears).
+            s = MgtwinTest.revcExample();
+            for k = 1:numel(s.transformers), s.transformers(k).x_pu = 0.06; end
+        end
+
+        function s = twoBessSite(functions, pickup_a, state_group)
+            % Two 5 MVA grid-forming BESS on B1 and B2, tied by breaker SW; its relay carries FUNCTIONS.
+            arguments
+                functions (1,:) mgtwin.ProtectionFunction = mgtwin.ProtectionFunction.empty(1,0)
+                pickup_a double = []
+                state_group (1,1) string = "A"
+            end
+            bess = @(i, b) mgtwin.Converter(id=i, bus=b, s_rated_mva=5.0, control=mgtwin.ConverterControl.GFM_DROOP, ...
+                params=mgtwin.ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2));
+            s = mgtwin.Site(id="T", base=mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0), ...
+                buses=[mgtwin.Bus(id="B1", v_nom_kv=11.0); mgtwin.Bus(id="B2", v_nom_kv=11.0)], ...
+                converters=[bess("BESS1", "B1"); bess("BESS2", "B2")], ...
+                switches=mgtwin.Switch(id="SW", from_bus="B1", to_bus="B2"), ...
+                relays=mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a, functions=functions), ...
+                islands=mgtwin.IslandConfig(id="I1", grid_connected=false, settings_group=state_group, ...
+                    energized_source_ids=["BESS1", "BESS2"]));
+        end
+
+        function rules = revcRules()
+            rules = [ ...
+                mgtwin.TagRule(pattern="^(?P<id>PCS\d+)\.(?P<meas>\w+)$", kind="converter", ...
+                    meas_map=dictionary(["P_MW", "Q_MVAR", "F", "SOC"], ["P", "Q", "F", "SOC"])), ...
+                mgtwin.TagRule(pattern="^(?P<id>SOFC\d\d)_(?P<meas>KW|KVAR|HZ)$", kind="converter", ...
+                    meas_map=dictionary(["KW", "KVAR", "HZ"], ["P", "Q", "F"])), ...
+                mgtwin.TagRule(pattern="^(?P<id>CB_\w+)\.POS$", kind="switch", measurement="POS"), ...
+                mgtwin.TagRule(pattern="^GEN\.(?P<meas>\w+)$", kind="machine", ...
+                    meas_map=dictionary(["P", "F"], ["P", "F"]), id_template="GEN_BS"), ...
+                mgtwin.TagRule(pattern="^(?P<id>PCS1)\.P_MW$", kind="converter", measurement="Q")];   % deliberately conflicting
+        end
+
+        function st = statusOf(rep, tag)
+            % statuses of every result for TAG, in order
+            rs = rep.results(arrayfun(@(r) r.tag.tag == tag, rep.results));
+            st = [rs.status];
+        end
+
+        function verifyThrows(tc, f, needle)
+            try
+                f();
+                tc.verifyFail("expected an error containing: " + needle);
+            catch err
+                tc.verifySubstring(err.message, needle);
+            end
+        end
+
         function s = minimalSite(varargin)
             s = mgtwin.Site("id", "T", "base", mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0), ...
                 "buses", mgtwin.Bus(id="B1", v_nom_kv=11.0), varargin{:});
@@ -864,6 +915,220 @@ classdef MgtwinTest < matlab.unittest.TestCase
                 [3, 1, 15, 279, 78, 2, 10, 4, 1, 1]);
             tc.verifyEqual(sort(keys(got)), sort(keys(expected)));
             tc.verifyEqual(got(keys(expected)), values(expected));
+        end
+
+        % -----------------------------------------------------------------
+        % Stage 6: the validity envelope (Python v0.6.6)
+        % -----------------------------------------------------------------
+        function test_envelope_a_site_wide_fail_puts_everything_outside(tc)
+            env = mgtwin.buildEnvelope(MgtwinTest.revcExample());
+            tc.verifyNotEmpty(env.site_wide_fails);
+            tc.verifySubstring(env.site_wide_fails(1), "transformer reactance");
+            [v, why] = env.check("NORMAL", "loading", load_mva=30.0);
+            tc.verifyEqual(v, mgtwin.Inside.OUTSIDE);
+            tc.verifySubstring(why(1), "site-wide");
+        end
+
+        function test_envelope_states_gates_and_tier(tc)
+            % The gates bound the envelope state by state; phenomena beyond the
+            % tier and states the Site does not enumerate are outside;
+            % storage-carried load is provisional; assumed parameters make
+            % frequency provisional.
+            env = mgtwin.buildEnvelope(MgtwinTest.revcRebased());
+            tc.verifyEmpty(env.site_wide_fails);
+            tc.verifyEqual(env.check("NORMAL", "loading", load_mva=37.0), mgtwin.Inside.INSIDE);
+            tc.verifyEqual(env.check("NORMAL", "loading", load_mva=60.0), mgtwin.Inside.PROVISIONAL);   % above 44 MVA sustained
+            tc.verifyEqual(env.check("NORMAL", "loading", load_mva=80.0), mgtwin.Inside.OUTSIDE);       % above 77 MVA in all
+            [v, why] = env.check("BLACKSTART_GEN", "loading");
+            tc.verifyEqual(v, mgtwin.Inside.OUTSIDE); tc.verifySubstring(why(1), "loading");
+            tc.verifyEqual(env.check("FAST_TRANSFER_WHOLE_SECTION", "energisation"), mgtwin.Inside.OUTSIDE);
+            tc.verifyEqual(env.check("SLOW_TRANSFER_ONE_GROUP", "energisation"), mgtwin.Inside.PROVISIONAL);   % assumed inrush
+            tc.verifyEqual(env.check("NORMAL", "emt"), mgtwin.Inside.OUTSIDE);
+            tc.verifyEqual(env.check("NORMAL", "voltage"), mgtwin.Inside.OUTSIDE);
+            tc.verifyEqual(env.check("NOT_A_STATE", "loading"), mgtwin.Inside.OUTSIDE);
+            [v, why] = env.check("NORMAL", "frequency", step_pu=0.3);
+            tc.verifyEqual(v, mgtwin.Inside.PROVISIONAL); tc.verifyTrue(any(contains(why, "assumed")));
+            tc.verifyTrue(any(contains(env.undeclared, "ranges over which the dynamic models hold")));
+        end
+
+        function test_envelope_identified_amplitudes_bound_a_step(tc)
+            % With every forming source identified over 0.1-0.5 pu steps, a
+            % 0.3 pu step is inside and a 0.65 pu step is an extrapolation;
+            % protection stays provisional while ride-through is assumed.
+            site = MgtwinTest.revcRebased();
+            isGfm = arrayfun(@(c) c.control ~= mgtwin.ConverterControl.GFL, site.converters);
+            gfm = [string({site.converters(isGfm).id}), string({site.machines.id})];
+            recs = arrayfun(@(s) mgtwin.IdentificationRecord(source_id=s, verdict="identified", ...
+                step_range_pu=[0.1 0.5], parameters=struct("rp", 0.04)), gfm);
+            env = mgtwin.buildEnvelope(site, identifications=recs);
+            tc.verifyEqual(env.check("NORMAL", "frequency", step_pu=0.3), mgtwin.Inside.INSIDE);
+            [v, why] = env.check("NORMAL", "frequency", step_pu=0.65);
+            tc.verifyEqual(v, mgtwin.Inside.PROVISIONAL); tc.verifySubstring(why(1), "extrapolation");
+            tc.verifyEqual(env.check("NORMAL", "protection"), mgtwin.Inside.PROVISIONAL);
+            recs(1).verdict = "structural_mismatch";
+            env2 = mgtwin.buildEnvelope(site, identifications=recs);
+            tc.verifyEqual(env2.check("NORMAL", "frequency", step_pu=0.3), mgtwin.Inside.PROVISIONAL);
+            d = jsondecode(env2.toJson());
+            tc.verifyEqual(d.states.NORMAL.rating_mva, 77.0);
+            tc.verifyEqual(string(d.phenomena.emt.support), "excluded");
+            tc.verifySubstring(env.render(), "# Validity envelope");
+            MgtwinTest.verifyThrows(tc, @() mgtwin.buildEnvelope(site, identifications= ...
+                mgtwin.IdentificationRecord(source_id="NOPE", verdict="identified", step_range_pu=[0.1 0.5])), "unknown sources");
+        end
+
+        % -----------------------------------------------------------------
+        % Stage 1: tag ingest (Python v0.6.6)
+        % -----------------------------------------------------------------
+        function test_ingest_maps_scales_and_flags_tags(tc)
+            T = @(t, u, p) mgtwin.Tag(tag=t, unit=u, sample_period_s=p);
+            tags = [T("PCS2.P_MW", "MW", 0.02), T("PCS2.F", "Hz", 0.02), T("SOFC01_KW", "kW", 1.0), ...
+                T("SOFC01_HZ", "Hz", 1.0), T("SOFC02_KW", "A", []), ...      % wrong unit for power
+                T("PCS3.TEMP_C", "degC", []), ...                            % code not in the map
+                T("PCS1.P_MW", "MW", []), ...                                % two rules disagree
+                T("CB_TIE.POS", "", []), T("CB_TIE.POS", "", []), ...        % a duplicate
+                T("HALL7.P", "MW", []), ...                                  % no rule
+                T("GEN.P", "kW", 0.1), T("GEN.F", "Hz", 0.1)];
+            rep = mgtwin.ingestTags(tags, MgtwinTest.revcRules());
+            st = @(t) MgtwinTest.statusOf(rep, t);
+            tc.verifyEqual([st("PCS2.P_MW"), st("SOFC01_KW"), st("GEN.P")], [mgtwin.TagStatus.MATCHED, mgtwin.TagStatus.MATCHED, mgtwin.TagStatus.MATCHED]);
+            tc.verifyEqual([st("PCS3.TEMP_C"), st("HALL7.P")], [mgtwin.TagStatus.UNMATCHED, mgtwin.TagStatus.UNMATCHED]);
+            tc.verifyEqual(st("PCS1.P_MW"), mgtwin.TagStatus.AMBIGUOUS);
+            tc.verifyEqual(st("CB_TIE.POS"), [mgtwin.TagStatus.MATCHED, mgtwin.TagStatus.DUPLICATE]);
+            k = rep.entityIndex("converter", "SOFC01");
+            tc.verifyEqual(rep.measurementResult(k, "P").scale, 1e-3);
+            bad = rep.results(arrayfun(@(r) r.tag.tag == "SOFC02_KW", rep.results));
+            tc.verifyTrue(any(contains(bad.notes, "is current, but P is power")));
+            tc.verifyEqual(rep.measurementResult(rep.entityIndex("machine", "GEN_BS"), "P").scale, 1e-3);
+            tc.verifySubstring(rep.render(), "## Flagged tags");
+            tc.verifyEqual(rep.toStruct().counts.ambiguous, 1);
+        end
+
+        function test_ingest_against_the_site(tc)
+            % Against Rev C: telemetry for equipment the Site lacks, equipment
+            % no tag observes, and which sources can be identified from
+            % operating data at a PMU-grade period.
+            T = @(t, u, p) mgtwin.Tag(tag=t, unit=u, sample_period_s=p);
+            tags = [T("PCS2.P_MW", "MW", 0.02), T("PCS2.F", "Hz", 0.02), T("SOFC01_KW", "kW", 1.0), ...
+                T("SOFC01_HZ", "Hz", 1.0), T("PCS9.P_MW", "MW", []), T("PCS3.P_MW", "MW", [])];
+            rep = mgtwin.ingestTags(tags, MgtwinTest.revcRules());
+            out = mgtwin.compareWithSite(rep, MgtwinTest.revcExample(), identification_period_s=0.05);
+            key = string({out.id}) + "|" + extractBefore(string({out.message}) + ":", ":");
+            tc.verifyTrue(ismember("PCS9|telemetry for equipment the Site does not hold", key));
+            tc.verifyTrue(ismember("PCS1|in the Site, but no tag observes it", key));
+            tc.verifyTrue(ismember("PCS3|cannot be identified from operating data", key));
+            tc.verifyTrue(ismember("SOFC01|sampled too slowly to identify (needs <= 0.05 s)", key));
+            tc.verifyFalse(any(string({out.id}) == "PCS2"));
+        end
+
+        function test_ingest_rules_are_checked(tc)
+            MgtwinTest.verifyThrows(tc, @() mgtwin.TagRule(pattern="^(?P<id>X)$", kind="widget", measurement="P"), "unknown kind");
+            MgtwinTest.verifyThrows(tc, @() mgtwin.TagRule(pattern="^X\.(?P<meas>P)$", kind="converter", ...
+                meas_map=dictionary("P", "P")), "named group 'id'");
+            MgtwinTest.verifyThrows(tc, @() mgtwin.TagRule(pattern="^(?P<id>X)\.(?P<meas>P)$", kind="converter", ...
+                meas_map=dictionary("P", "POWER")), "unknown measurement");
+        end
+
+        % -----------------------------------------------------------------
+        % Protection functions, settings groups, screening (Python v0.6.8)
+        % -----------------------------------------------------------------
+        function test_protection_functions_are_validated(tc)
+            PF = @(varargin) mgtwin.ProtectionFunction(varargin{:});
+            MgtwinTest.verifyThrows(tc, @() PF(ansi="99X"), "unknown ANSI");
+            MgtwinTest.verifyThrows(tc, @() PF(ansi="67N", pickup_a=50.0), "needs a direction");
+            MgtwinTest.verifyThrows(tc, @() PF(ansi="87L"), "zone's buses");
+            MgtwinTest.verifyThrows(tc, @() mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0), ...
+                "declares no protection element");
+            MgtwinTest.verifyThrows(tc, @() MgtwinTest.twoBessSite(PF(ansi="87L", zone_buses=["B1", "NOPE"])), "unknown bus");
+        end
+
+        function test_a_legacy_relay_reads_as_one_phase_element(tc)
+            r = mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=300.0, time_dial=0.3);
+            e = r.elements();
+            tc.verifyNumElements(e, 1);
+            tc.verifyEqual(e.ansi, "51"); tc.verifyEqual(e.pickup_a, 300.0); tc.verifyTrue(e.activeIn("BLACKSTART"));
+            r2 = mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=300.0, directional=true);
+            tc.verifyEqual(r2.elements().ansi, "67");
+        end
+
+        function test_protection_gate_fails_an_unset_settings_group(tc)
+            % The black-start state runs group BS; a relay set only for the
+            % grid-connected group G leaves the breaker unprotected there.
+            % Give it a low-set 51 in BS and the state is screened again.
+            gridOnly = mgtwin.ProtectionFunction(ansi="51", pickup_a=1200.0, groups="G");
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(gridOnly, [], "BS"));
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.FAIL), ...
+                "no element of relay R is active in settings group 'BS'"));
+            both = [gridOnly, mgtwin.ProtectionFunction(ansi="51", pickup_a=200.0, groups="BS")];
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(both, [], "BS"));
+            tc.verifyFalse(rep.failed());
+            fs = rep.findings(contains(string({rep.findings.message}), "pickup available"));
+            tc.verifyEqual(string({fs.scope}), "I1/R/51");
+        end
+
+        function test_protection_gate_names_magnitude_only_breakers(tc)
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(mgtwin.ProtectionFunction.empty(1,0), 150.0));
+            w = rep.bySeverity(mgtwin.Severity.WARN);
+            w = w(contains(string({w.message}), "current-limited converters"));
+            tc.verifyNotEmpty(w); tc.verifySubstring(w(1).message, "rests on magnitude at R");
+            unit = mgtwin.ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"]);
+            rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(unit, 150.0));
+            tc.verifyFalse(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.WARN), "current-limited converters"));
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.PASS), "does not rest on magnitude alone"));
+        end
+
+        function test_protection_gate_wants_direction_both_sides(tc)
+            % BESS on each side of SW: a non-directional 51 sees through-faults;
+            % a 67 or an 87L does not need the WARN.
+            bothSides = @(rep) MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.WARN), "from both sides");
+            tc.verifyTrue(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite(mgtwin.ProtectionFunction.empty(1,0), 150.0))));
+            tc.verifyFalse(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
+                mgtwin.ProtectionFunction(ansi="67", pickup_a=150.0, direction="forward")))));
+            tc.verifyFalse(bothSides(mgtwin.gateProtection(MgtwinTest.twoBessSite( ...
+                mgtwin.ProtectionFunction(ansi="87L", zone_buses=["B1", "B2"]), 150.0))));
+        end
+
+        function test_envelope_takes_protection_studies(tc)
+            % A study supersedes the screening for the state it covers: failed
+            % -> outside; passed on assumed converter models -> provisional,
+            % naming the study; on identified models -> inside. States it does
+            % not cover keep the screening's provisional verdict.
+            path = string(tempname) + ".json";
+            fid = fopen(path, "w");
+            fprintf(fid, '%s', jsonencode({ ...
+                struct("state_id", "NORMAL", "tool", "Electrisim", "passed", true, "reference", "C003 report Rev 6, s. 9"), ...
+                struct("state_id", "N1_PCS", "tool", "Electrisim", "passed", true, "models_identified", true), ...
+                struct("state_id", "MVA_BUS_FAULT", "tool", "Electrisim", "passed", false)}));
+            fclose(fid);
+            cleanup = onCleanup(@() delete(path));
+            site = MgtwinTest.revcRebased();
+            env = mgtwin.buildEnvelope(site, protection_studies=mgtwin.loadProtectionStudies(path));
+            [v, why] = env.check("NORMAL", "protection");
+            tc.verifyEqual(v, mgtwin.Inside.PROVISIONAL);
+            tc.verifyEqual(why, "studied in Electrisim (C003 report Rev 6, s. 9) on assumed converter current limits and ride-through");
+            [v, why] = env.check("N1_PCS", "protection");
+            tc.verifyEqual(v, mgtwin.Inside.INSIDE); tc.verifyEmpty(why);
+            [v, why] = env.check("MVA_BUS_FAULT", "protection");
+            tc.verifyEqual(v, mgtwin.Inside.OUTSIDE); tc.verifySubstring(why(1), "Electrisim protection study");
+            [v, why] = env.check("N1_SOFC", "protection");
+            tc.verifyEqual(v, mgtwin.Inside.PROVISIONAL); tc.verifyTrue(any(contains(why, "ride-through assumed")));
+            tc.verifySubstring(env.render(), "## Protection studies");
+            tc.verifyTrue(env.toStruct().protection_studies.N1_PCS.passed);
+            MgtwinTest.verifyThrows(tc, @() mgtwin.buildEnvelope(site, protection_studies= ...
+                mgtwin.ProtectionStudyRecord(state_id="NOPE", tool="Electrisim", passed=true)), "does not enumerate");
+        end
+
+        function test_protection_findings_match_python_on_banshee(tc)
+            % gateProtection on Banshee gives Python v0.6.8's findings exactly:
+            % 13, with the three feeder heads fed from both sides in ISL_ALL.
+            tc.assumeBanshee();
+            P = banshee_paths();
+            site = mgtwin.composeBanshee(P.CASE_V5, relay_dir=P.RELAYS, mdl_path=P.MDL);
+            rep = mgtwin.gateProtection(site);
+            tc.verifyNumElements(rep.findings, 13);
+            both = rep.findings(contains(string({rep.findings.message}), "from both sides"));
+            tc.verifyEqual(string({both.scope}), ["ISL_ALL/R_F1_HEAD", "ISL_ALL/R_F2_HEAD", "ISL_ALL/R_F3_HEAD"]);
+            f = rep.findings(string({rep.findings.scope}) == "ISL_F3/R_F2_HEAD");
+            tc.verifyEqual(f.message, "fault current 581 A gives only 1.23x pickup, below the 1.5x dependability margin; operating time will be very long");
         end
     end
 end

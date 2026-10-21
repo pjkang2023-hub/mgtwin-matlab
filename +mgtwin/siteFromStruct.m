@@ -44,6 +44,10 @@ for f = string(fieldnames(item))'
         v = mgtwin.internal.enumFromValue(enums.(f), v);
     elseif f == "params"
         v = build(@mgtwin.ConverterParams, v, struct());
+    elseif f == "functions"
+        if ~iscell(v), v = num2cell(v); end
+        fs = cellfun(@(it) build(@mgtwin.ProtectionFunction, it, struct()), v(:)', "UniformOutput", false);
+        v = [fs{:}];
     elseif iscell(v) || ischar(v)
         v = string(v);
         if ~isscalar(v) || iscell(item.(f)), v = reshape(v, 1, []); end
