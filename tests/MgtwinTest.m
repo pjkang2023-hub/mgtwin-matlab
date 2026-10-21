@@ -1,0 +1,869 @@
+classdef MgtwinTest < matlab.unittest.TestCase
+    %MGTWINTEST Regression tests for the mgtwin MATLAB package.
+    %
+    %   The tests that matter here are the ones asserting that a gate FAILS.
+    %   A harness whose gates quietly stop firing is worse than no harness,
+    %   because the report still looks clean. So the negative cases are
+    %   tested at least as carefully as the positive ones.
+    %
+    %   Run with:  runtests("tests/MgtwinTest.m")
+    %   Banshee-dependent tests are skipped unless BANSHEE_DATA points at the
+    %   extracted EPHCC release.
+
+    properties (Constant)
+        RP = 0.05
+        TP = 0.20
+        H = 2.0
+    end
+
+    methods (TestClassSetup)
+        function setupPath(tc)
+            root = fileparts(fileparts(mfilename("fullpath")));
+            tc.applyFixture(matlab.unittest.fixtures.PathFixture(root));
+            tc.applyFixture(matlab.unittest.fixtures.PathFixture(fullfile(root, "examples")));
+        end
+    end
+
+    % ---------------------------------------------------------------------
+    % Helpers
+    % ---------------------------------------------------------------------
+    methods (Static)
+        function s = revcExample()
+            % CAMPAIGN-003 Rev C, as Python's mgtwin writes it (examples/).
+            root = fileparts(fileparts(mfilename("fullpath")));
+            s = mgtwin.siteFromJson(fullfile(root, "examples", "c003_revC_site.json"));
+        end
+
+        function fs = scoped(rep, prefix)
+            % findings whose scope starts with PREFIX
+            if isempty(rep.findings), fs = rep.findings; return; end
+            fs = rep.findings(startsWith(string({rep.findings.scope}), prefix));
+        end
+
+        function w = worstByIsland(rep)
+            % island id -> worst severity among its findings
+            w = dictionary(string.empty, string.empty);
+            rank = dictionary(["pass", "warn", "fail"], [0, 1, 2]);
+            for k = 1:numel(rep.findings)
+                f = rep.findings(k);
+                isl = extractBefore(f.scope + "/", "/");
+                if ~isKey(w, isl) || rank(f.severity.Value) >= rank(w(isl))
+                    w(isl) = f.severity.Value;
+                end
+            end
+        end
+
+        function s = minimalSite(varargin)
+            s = mgtwin.Site("id", "T", "base", mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0), ...
+                "buses", mgtwin.Bus(id="B1", v_nom_kv=11.0), varargin{:});
+        end
+
+        function s = converterOnlySite(pickup_a)
+            s = MgtwinTest.minimalSite( ...
+                "converters", mgtwin.Converter(id="BESS", bus="B1", s_rated_mva=5.0, ...
+                    control=mgtwin.ConverterControl.GFM_DROOP, ...
+                    params=mgtwin.ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2)), ...
+                "switches", mgtwin.Switch(id="SW", from_bus="B1", to_bus="B1"), ...
+                "relays", mgtwin.OvercurrentRelay(id="R", switch_id="SW", ct_ratio=600.0, pickup_a=pickup_a, time_dial=0.3), ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false, energized_source_ids="BESS"));
+        end
+
+        function res = fit(dt_meas, sigma, t_end, ramp_limit, theta0, bounds, fixed, seed)
+            if nargin < 8, seed = 7; end
+            [t, p] = mgtwin.loadStep(t_end=t_end, dt=0.002);
+            truth = mgtwin.simulateGfm(t, p, MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H, ramp_limit_pu_s=ramp_limit);
+            idx = (1:round(dt_meas / 0.002):numel(t))';
+            rs = RandStream("mt19937ar", "Seed", seed);
+            y = truth(idx, 1) + sigma * randn(rs, numel(idx), 1);
+            predict = @(theta) MgtwinTest.predictGfm(t, p, idx, theta, fixed);
+            res = mgtwin.identify(predict, y, theta0, bounds);
+        end
+
+        function yhat = predictGfm(t, p, idx, theta, fixed)
+            get = @(nm) MgtwinTest.getParam(theta, fixed, nm);
+            out = mgtwin.simulateGfm(t, p, get("rp_pu"), get("tp_sec"), get("h_sec"));
+            yhat = out(idx, 1);
+        end
+
+        function v = getParam(theta, fixed, nm)
+            if isfield(theta, nm), v = theta.(nm); else, v = fixed.(nm); end
+        end
+
+        function tf = anyMessageContains(findings, needle)
+            tf = false;
+            for k = 1:numel(findings)
+                if contains(findings(k).message, needle), tf = true; return; end
+            end
+        end
+
+        function [site, suite, limits] = rung3Fixture()
+            P = banshee_paths();
+            site = mgtwin.composeBanshee(P.CASE_V5, relay_dir=P.RELAYS, mdl_path=P.MDL);
+            suite = mgtwin.loadSuite("ieee2030_8_2018");
+            limits = banshee_example_limits();
+        end
+    end
+
+    methods
+        function assumeBanshee(tc)
+            P = banshee_paths();
+            tc.assumeTrue(P.available, "Banshee EPHCC release not present (set BANSHEE_DATA)");
+        end
+    end
+
+    methods (Test)
+        % -----------------------------------------------------------------
+        % Units
+        % -----------------------------------------------------------------
+        function test_per_unit_base_arithmetic(tc)
+            b = mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0, f_base_hz=50.0);
+            tc.verifyEqual(b.z_base_ohm, 121.0 / 10.0, "RelTol", 1e-12);
+            tc.verifyEqual(b.i_base_a, 10e6 / (sqrt(3) * 11e3), "RelTol", 1e-9);
+            tc.verifyEqual(b.puCurrent(b.amps(1.37)), 1.37, "RelTol", 1e-12);
+            tc.verifyEqual(b.puImpedance(b.ohms(0.08)), 0.08, "RelTol", 1e-12);
+        end
+
+        function test_rebase_impedance(tc)
+            old = mgtwin.Base(s_base_mva=100.0, v_base_kv=11.0);
+            new = mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0);
+            tc.verifyEqual(new.rebaseImpedance(0.50, old), 0.05, "RelTol", 1e-12);
+        end
+
+        function test_invalid_base_rejected(tc)
+            tc.verifyError(@() mgtwin.Base(s_base_mva=-1.0, v_base_kv=11.0), "mgtwin:ValueError");
+            tc.verifyError(@() mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0, f_base_hz=45.0), "mgtwin:ValueError");
+        end
+
+        % -----------------------------------------------------------------
+        % Ontology integrity
+        % -----------------------------------------------------------------
+        function test_dangling_bus_reference_rejected(tc)
+            f = @() MgtwinTest.minimalSite("converters", mgtwin.Converter(id="C1", bus="NOPE", ...
+                s_rated_mva=1.0, control=mgtwin.ConverterControl.GFL, params=mgtwin.ConverterParams()));
+            tc.verifyError(f, "mgtwin:ValidationError");
+            try, f(); catch e, tc.verifySubstring(e.message, "unknown bus"); end
+        end
+
+        function test_gfm_without_droop_rejected(tc)
+            f = @() mgtwin.Converter(id="C1", bus="B1", s_rated_mva=1.0, ...
+                control=mgtwin.ConverterControl.GFM_DROOP, params=mgtwin.ConverterParams());
+            tc.verifyError(f, "mgtwin:ValidationError");
+            try, f(); catch e, tc.verifySubstring(e.message, "no P-f droop"); end
+        end
+
+        function test_vsm_without_inertia_rejected(tc)
+            f = @() mgtwin.Converter(id="C1", bus="B1", s_rated_mva=1.0, ...
+                control=mgtwin.ConverterControl.GFM_VSM, params=mgtwin.ConverterParams(p_f_droop_pu=0.05));
+            tc.verifyError(f, "mgtwin:ValidationError");
+            try, f(); catch e, tc.verifySubstring(e.message, "no inertia"); end
+        end
+
+        function test_solid_grounding_with_large_impedance_rejected(tc)
+            f = @() mgtwin.GroundingSource(id="G", bus="B1", kind=mgtwin.GroundingKind.SOLID, ...
+                z0_ohm=25.0, available_when_islanded=true);
+            tc.verifyError(f, "mgtwin:ValidationError");
+            try, f(); catch e, tc.verifySubstring(e.message, "solid grounding"); end
+        end
+
+        function test_steady_limit_above_transient_rejected(tc)
+            f = @() mgtwin.ConverterParams(i_limit_transient_pu=1.2, i_limit_steady_pu=1.5);
+            tc.verifyError(f, "mgtwin:ValidationError");
+            try, f(); catch e, tc.verifySubstring(e.message, "steady-state current limit"); end
+        end
+
+        function test_missing_required_argument_rejected(tc)
+            tc.verifyError(@() mgtwin.Bus(id="B1"), "mgtwin:ValidationError");
+        end
+
+        % -----------------------------------------------------------------
+        % Gates
+        % -----------------------------------------------------------------
+        function test_units_gate_catches_ohms_in_a_pu_field(tc)
+            % A 12.1 ohm feeder entered as 12.1 pu must not pass.
+            site = MgtwinTest.minimalSite( ...
+                "buses", [mgtwin.Bus(id="B1", v_nom_kv=11.0); mgtwin.Bus(id="B2", v_nom_kv=11.0)], ...
+                "branches", mgtwin.Branch(id="F1", from_bus="B1", to_bus="B2", r_pu=0.01, x_pu=12.1, ...
+                    s_base_mva=10.0, v_base_kv=11.0, rating_mva=10.0));
+            rep = mgtwin.gateUnits(site);
+            tc.verifyTrue(rep.failed());
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.FAIL), "plausible range"));
+        end
+
+        function test_units_gate_catches_transformer_ratio_mismatch(tc)
+            site = MgtwinTest.minimalSite( ...
+                "buses", [mgtwin.Bus(id="HV", v_nom_kv=33.0); mgtwin.Bus(id="LV", v_nom_kv=11.0)], ...
+                "transformers", mgtwin.Transformer(id="TX", hv_bus="HV", lv_bus="LV", s_rated_mva=15.0, ...
+                    hv_kv=33.0, lv_kv=6.6, x_pu=0.08, ...   % wrong: bus is 11 kV
+                    hv_config=mgtwin.WindingConfig.WYE_GROUNDED, lv_config=mgtwin.WindingConfig.DELTA));
+            tc.verifyTrue(mgtwin.gateUnits(site).failed());
+        end
+
+        function test_grounding_fails_when_reference_is_outside_the_microgrid(tc)
+            site = MgtwinTest.minimalSite( ...
+                "converters", mgtwin.Converter(id="C1", bus="B1", s_rated_mva=1.0, ...
+                    control=mgtwin.ConverterControl.GFM_DROOP, params=mgtwin.ConverterParams(p_f_droop_pu=0.05)), ...
+                "grounding", mgtwin.GroundingSource(id="G", bus="B1", kind=mgtwin.GroundingKind.SOLID, ...
+                    available_when_islanded=false), ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false, energized_source_ids="C1"));
+            rep = mgtwin.gateGrounding(site);
+            tc.verifyTrue(rep.failed());
+            fail = rep.bySeverity(mgtwin.Severity.FAIL);
+            tc.verifySubstring(fail(1).message, "zero-sequence");
+            tc.verifyTrue(startsWith(fail(1).scope, "I1/zone"));
+        end
+
+        function test_grounding_zones_split_by_delta_winding(tc)
+            % The Banshee lesson as a unit test: a DYg transformer grounds its
+            % LV zone and nothing else. The MV zone with the source must FAIL
+            % even though the LV zone passes.
+            site = MgtwinTest.minimalSite( ...
+                "buses", [mgtwin.Bus(id="MV", v_nom_kv=13.8); mgtwin.Bus(id="LV", v_nom_kv=0.48)], ...
+                "transformers", mgtwin.Transformer(id="TX", hv_bus="MV", lv_bus="LV", s_rated_mva=2.0, ...
+                    hv_kv=13.8, lv_kv=0.48, x_pu=0.0575, ...
+                    hv_config=mgtwin.WindingConfig.DELTA, lv_config=mgtwin.WindingConfig.WYE_GROUNDED), ...
+                "converters", mgtwin.Converter(id="GFM", bus="MV", s_rated_mva=2.0, ...
+                    control=mgtwin.ConverterControl.GFM_DROOP, params=mgtwin.ConverterParams(p_f_droop_pu=0.05)), ...
+                "loads", mgtwin.Load(id="L", bus="LV", p_mw=0.5), ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false, energized_source_ids="GFM"));
+            rep = mgtwin.gateGrounding(site);
+            lvSev = mgtwin.Severity.empty(0,1); mvSev = mgtwin.Severity.empty(0,1);
+            for f = rep.findings'
+                if contains(f.scope, "0.48"), lvSev(end+1) = f.severity; end %#ok<AGROW>
+                if contains(f.scope, "13.8"), mvSev(end+1) = f.severity; end %#ok<AGROW>
+            end
+            tc.verifyNotEmpty(lvSev); tc.verifyEqual(lvSev(1), mgtwin.Severity.PASS);
+            tc.verifyNotEmpty(mvSev); tc.verifyEqual(mvSev(1), mgtwin.Severity.FAIL);
+        end
+
+        function test_grounding_gate_passes_when_reference_survives_islanding(tc)
+            site = MgtwinTest.minimalSite( ...
+                "grounding", mgtwin.GroundingSource(id="G", bus="B1", kind=mgtwin.GroundingKind.LOW_RESISTANCE, ...
+                    z0_ohm=12.0, available_when_islanded=true), ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false));
+            tc.verifyFalse(mgtwin.gateGrounding(site).failed());
+        end
+
+        function test_grounding_gate_fails_when_nothing_declared(tc)
+            % Silence is not a pass. An undeclared grounding scheme is a finding.
+            site = MgtwinTest.minimalSite("islands", mgtwin.IslandConfig(id="I1", grid_connected=false));
+            tc.verifyTrue(mgtwin.gateGrounding(site).failed());
+        end
+
+        function test_protection_gate_fails_below_pickup(tc)
+            % 5 MVA at 11 kV -> 262 A rated, x1.2 limit -> 315 A available.
+            rep = mgtwin.gateProtection(MgtwinTest.converterOnlySite(600.0));
+            tc.verifyTrue(rep.failed());
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.FAIL), "never operate"));
+        end
+
+        function test_protection_gate_fails_inside_dependability_margin(tc)
+            % Above pickup but below margin is still a FAIL, not a warning.
+            rep = mgtwin.gateProtection(MgtwinTest.converterOnlySite(250.0));  % ratio ~1.26
+            tc.verifyTrue(rep.failed());
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.FAIL), "dependability margin"));
+        end
+
+        function test_protection_gate_passes_with_adequate_margin(tc)
+            rep = mgtwin.gateProtection(MgtwinTest.converterOnlySite(150.0));  % ratio ~2.1
+            tc.verifyFalse(rep.failed());
+        end
+
+        function test_protection_warns_on_converter_dominance_even_when_passing(tc)
+            rep = mgtwin.gateProtection(MgtwinTest.converterOnlySite(150.0));
+            tc.verifyTrue(MgtwinTest.anyMessageContains(rep.bySeverity(mgtwin.Severity.WARN), "current-limited converters"));
+        end
+
+        function test_converter_fault_contribution_is_current_limited(tc)
+            % 5 MVA at 11 kV is 262 A rated; contribution should be ~315 A, not thousands.
+            base = mgtwin.Base(s_base_mva=10.0, v_base_kv=11.0);
+            c = mgtwin.Converter(id="C", bus="B1", s_rated_mva=5.0, control=mgtwin.ConverterControl.GFM_DROOP, ...
+                params=mgtwin.ConverterParams(p_f_droop_pu=0.05, i_limit_transient_pu=1.2));
+            tc.verifyEqual(c.faultContributionA(base), 315.0, "RelTol", 0.01);
+        end
+
+        function test_demo_site_gates_block_then_pass(tc)
+            rep = mgtwin.runAllGates(build_demo_site(false));
+            tc.verifyTrue(rep.failed());
+            gates = unique(string({rep.bySeverity(mgtwin.Severity.FAIL).gate}));
+            tc.verifyTrue(all(ismember(["grounding", "protection"], gates)));
+            rep2 = mgtwin.runAllGates(build_demo_site(true));
+            tc.verifyFalse(rep2.failed());
+            tc.verifyTrue(rep2.warned());   % converter-dominance warning survives remediation
+        end
+
+        % -----------------------------------------------------------------
+        % Residual diagnostics
+        % -----------------------------------------------------------------
+        function test_whiteness_accepts_white_noise(tc)
+            rs = RandStream("mt19937ar", "Seed", 0);
+            tc.verifyTrue(mgtwin.assessWhiteness(randn(rs, 500, 1), 2).white);
+        end
+
+        function test_whiteness_rejects_a_deterministic_trend(tc)
+            t = linspace(0, 1, 500)';
+            rs = RandStream("mt19937ar", "Seed", 0);
+            resid = 0.5 * sin(2 * pi * 2 * t) + 0.05 * randn(rs, numel(t), 1);
+            tc.verifyFalse(mgtwin.assessWhiteness(resid, 2).white);
+        end
+
+        % -----------------------------------------------------------------
+        % Identification: the honesty properties
+        % -----------------------------------------------------------------
+        function test_well_posed_case_recovers_truth(tc)
+            res = MgtwinTest.fit(0.02, 2e-4, 8.0, [], ...
+                struct("rp_pu", 0.03, "tp_sec", 0.40), ...
+                struct("rp_pu", [0.005, 0.20], "tp_sec", [0.01, 2.0]), ...
+                struct("h_sec", MgtwinTest.H));
+            tc.verifyEqual(res.verdict, mgtwin.Verdict.IDENTIFIED);
+            tc.verifyEqual(res.theta(1), MgtwinTest.RP, "RelTol", 0.02);
+            tc.verifyEqual(res.theta(2), MgtwinTest.TP, "RelTol", 0.05);
+            tc.verifyTrue(res.whiteness.white);
+        end
+
+        function test_historian_grade_data_is_reported_not_identifiable(tc)
+            % When the experiment cannot support the parameter set, the gate
+            % must refuse rather than return the optimiser's answer.
+            res = MgtwinTest.fit(1.0, 1e-3, 20.0, [], ...
+                struct("rp_pu", 0.03, "tp_sec", 0.40, "h_sec", 1.0), ...
+                struct("rp_pu", [0.005, 0.20], "tp_sec", [0.01, 2.0], "h_sec", [0.05, 20.0]), ...
+                struct());
+            tc.verifyEqual(res.verdict, mgtwin.Verdict.NOT_IDENTIFIABLE);
+            tc.verifyGreaterThan(res.cond_number, 1e3);
+            % And the point of the refusal: the returned estimate is badly wrong.
+            tc.verifyGreaterThan(abs(res.theta(2) - MgtwinTest.TP) / MgtwinTest.TP, 0.5);
+        end
+
+        function test_model_form_mismatch_overrides_tight_intervals(tc)
+            % The single most important behaviour in the package.
+            res = MgtwinTest.fit(0.02, 2e-4, 8.0, 0.30, ...
+                struct("rp_pu", 0.03, "tp_sec", 0.40), ...
+                struct("rp_pu", [0.005, 0.20], "tp_sec", [0.01, 2.0]), ...
+                struct("h_sec", MgtwinTest.H), 11);
+            tc.verifyEqual(res.verdict, mgtwin.Verdict.STRUCTURAL_MISMATCH);
+            tc.verifyFalse(res.whiteness.white);
+            tc.verifyLessThan(res.rel_se(2), 0.05);   % intervals look reassuring...
+            tc.verifyGreaterThan(abs(res.theta(2) - MgtwinTest.TP) / MgtwinTest.TP, 0.5);  % ...while biased
+            tc.verifyTrue(any(contains(res.notes, "optimistically biased")));
+        end
+
+        % -----------------------------------------------------------------
+        % Model numerics
+        % -----------------------------------------------------------------
+        function test_droop_steady_state_matches_analytic_value(tc)
+            [t, p] = mgtwin.loadStep(t_end=30.0, dt=0.002, p_before=0.30, p_after=0.30);
+            y = mgtwin.simulateGfm(t, p, MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H);
+            tc.verifyEqual(y(end, 1), 1.0 - MgtwinTest.RP * 0.30, "AbsTol", 1e-6);
+            tc.verifyEqual(y(end, 2), 0.30, "AbsTol", 1e-6);
+        end
+
+        function test_load_increase_lowers_frequency(tc)
+            [t, p] = mgtwin.loadStep();
+            y = mgtwin.simulateGfm(t, p, MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H);
+            tc.verifyLessThan(y(end, 1), y(1, 1));
+        end
+
+        function test_ramp_limit_slows_the_response(tc)
+            [t, p] = mgtwin.loadStep();
+            fast = mgtwin.simulateGfm(t, p, MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H);
+            slow = mgtwin.simulateGfm(t, p, MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H, ramp_limit_pu_s=0.30);
+            tc.verifyEqual(slow(end, 1), fast(end, 1), "AbsTol", 1e-4);
+            i = find(t >= 1.3, 1);
+            tc.verifyLessThan(slow(i, 2), fast(i, 2));
+        end
+
+        function test_simulator_rejects_non_monotonic_time(tc)
+            tc.verifyError(@() mgtwin.simulateGfm([0.0, 0.1, 0.05], zeros(1, 3), ...
+                MgtwinTest.RP, MgtwinTest.TP, MgtwinTest.H), "mgtwin:ValueError");
+        end
+
+        % -----------------------------------------------------------------
+        % Test spec
+        % -----------------------------------------------------------------
+        function test_suite_loads_and_carries_no_invented_limits(tc)
+            suite = mgtwin.loadSuite("ieee2030_8_2018");
+            tc.verifyNotEmpty(suite.cases);
+            % Every clause reference must be blank: none is reproduced from the standard.
+            tc.verifyTrue(all(strlength([suite.cases.clause]) == 0));
+            % Any limit that IS set must not claim the standard as its source
+            % unless it is a structural zero.
+            for c = suite.cases
+                for cr = c.criteria
+                    if ~isempty(cr.limit)
+                        tc.verifyTrue(cr.limit_source ~= "standard" || cr.limit == 0.0);
+                    end
+                end
+            end
+        end
+
+        function test_emt_cases_are_flagged(tc)
+            suite = mgtwin.loadSuite("ieee2030_8_2018");
+            ids = string({suite.emtCases().id});
+            tc.verifyTrue(all(ismember(["BLK-01", "PROT-01"], ids)));
+        end
+
+        % -----------------------------------------------------------------
+        % Rung 2: unbalanced solver vs IEEE 4-node, and SLG fault module
+        % -----------------------------------------------------------------
+        function test_ieee4_both_connections_match_published_solutions(tc)
+            D = ieee4_data();
+            for conn = ["GrY-GrY", "D-GrY"]
+                [v_nodes, ~] = ieee4_build(conn).solve();
+                got = struct("v3", mgtwin.polar(v_nodes{3}), "v4", mgtwin.polar(v_nodes{4}));
+                ref = D.REFS.(matlab.lang.makeValidName(conn));
+                for node = ["v3", "v4"]
+                    tc.verifyLessThan(abs(got.(node)(:, 1) - ref.(node)(:, 1)), 2.0, conn + " " + node);
+                    tc.verifyLessThan(abs(got.(node)(:, 2) - ref.(node)(:, 2)), 0.15, conn + " " + node);
+                end
+            end
+        end
+
+        function test_dgy_thirty_degree_shift_and_zero_sequence_blocking(tc)
+            % Exactly 30 degrees holds at NO load (pure connection rotation).
+            f_yy = ieee4_build("GrY-GrY"); f_dy = ieee4_build("D-GrY");
+            f_yy.load_kw = [0 0 0]; f_dy.load_kw = [0 0 0];
+            [v_yy, ~] = f_yy.solve(); [v_dy, ~] = f_dy.solve();
+            a_yy = mgtwin.polar(v_yy{4}); a_dy = mgtwin.polar(v_dy{4});
+            for ph = 1:3
+                shift = mod(a_yy(ph, 2) - a_dy(ph, 2), 360.0);
+                tc.verifyEqual(shift, 30.0, "AbsTol", 1e-9);
+            end
+            % Zero-sequence current on the delta (source) side must vanish
+            % (checked on the LOADED case, where I0 on the wye side is large).
+            feeder = ieee4_build("D-GrY");
+            [~, i_load] = feeder.solve();
+            tx = feeder.elements{2};
+            i_hi = tx.d * i_load;
+            i0_hi = abs(sum(i_hi)) / 3.0;
+            i0_lo = abs(sum(i_load)) / 3.0;
+            tc.verifyGreaterThan(i0_lo, 50.0);
+            tc.verifyLessThan(i0_hi, 1e-6 * i0_lo);
+        end
+
+        function test_ladder_refuses_to_return_unconverged(tc)
+            D = ieee4_data();
+            f = mgtwin.RadialFeeder(v_source_ln=mgtwin.balancedSourceLn(12.47), ...
+                elements={mgtwin.LineSegment(D.Z_Y, 2000.0)}, load_kw=D.LOAD_KW, load_pf=D.LOAD_PF);
+            tc.verifyError(@() f.solve(max_iter=1), "mgtwin:ConvergenceError");
+        end
+
+        function test_slg_ungrounded_is_exactly_sqrt3(tc)
+            res = mgtwin.slgFault(0.01 + 0.8i, z0_pu=[]);
+            tc.verifyFalse(res.grounded);
+            tc.verifyEqual(res.i_fault_pu, 0.0);
+            tc.verifyEqual(res.v_max_unfaulted_pu, sqrt(3.0), "RelTol", 1e-12);
+        end
+
+        function test_slg_resistive_grounding_exceeds_sqrt3(tc)
+            % Low-resistance grounding buys detection, not relief.
+            res = mgtwin.slgFault(0.013 + 0.77i, z0_pu=3.8 + 0.1i);
+            tc.verifyTrue(res.grounded);
+            tc.verifyGreaterThan(abs(res.i_fault_pu), 0.5);
+            tc.verifyGreaterThan(res.v_max_unfaulted_pu, sqrt(3.0));
+        end
+
+        function test_slg_effective_grounding_relieves_overvoltage(tc)
+            res = mgtwin.slgFault(0.013 + 0.77i, z0_pu=0.05 + 1.6i);
+            tc.verifyLessThan(res.v_max_unfaulted_pu, 1.4);
+            tc.verifyGreaterThan(abs(res.i_fault_pu), 0.8);
+        end
+
+        function test_slg_faulted_phase_is_zero_for_bolted_fault(tc)
+            res = mgtwin.slgFault(0.02 + 0.5i, z0_pu=0.05 + 1.0i, zf_pu=0.0);
+            tc.verifyLessThan(abs(res.v_abc_pu(1)), 1e-12);
+        end
+
+        % -----------------------------------------------------------------
+        % Rung 3: the test runner's honesty taxonomy
+        % -----------------------------------------------------------------
+        function test_runner_rejects_island_without_gfm(tc)
+            site = MgtwinTest.minimalSite( ...
+                "converters", mgtwin.Converter(id="PV", bus="B1", s_rated_mva=1.0, ...
+                    control=mgtwin.ConverterControl.GFL, params=mgtwin.ConverterParams()), ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false, energized_source_ids="PV"));
+            f = @() mgtwin.internal.aggregateSource(site, site.islands(1));
+            tc.verifyError(f, "mgtwin:ValueError");
+            try, f(); catch e, tc.verifySubstring(e.message, "no grid-forming source"); end
+        end
+
+        function test_runner_taxonomy_on_demo_island(tc)
+            % Synthetic stand-in for the Banshee rung-3 fixture: the demo
+            % site's ISL_1 is ungrounded as handed over, so PROT-01 must be
+            % BLOCKED with the grounding finding attached; RMS cases execute;
+            % the rest defer with the tier named.
+            site = build_demo_site(false);
+            suite = mgtwin.loadSuite("ieee2030_8_2018");
+            rep = mgtwin.runSuite(site, suite, "ISL_1");
+            prot = rep.byCaseId("PROT-01");
+            tc.verifyEqual(prot.status, mgtwin.CaseStatus.BLOCKED);
+            tc.verifyTrue(any(string({prot.blocking_findings.gate}) == "grounding"));
+            deferred = string.empty(1,0);
+            for r = rep.results
+                if r.status == mgtwin.CaseStatus.DEFERRED, deferred(end+1) = r.test_case.id; end %#ok<AGROW>
+            end
+            tc.verifyEqual(sort(deferred), sort(["DISP-01", "DISP-02", "REC-01", "BLK-01", "PQ-01"]));
+            c = rep.counts();
+            tc.verifyEqual([c.executed, c.blocked, c.deferred], [3, 1, 5]);
+            % Without project limits, nothing with a null spec limit is evaluated.
+            for r = rep.results
+                if r.status ~= mgtwin.CaseStatus.EXECUTED, continue; end
+                for cr = r.criteria
+                    if isempty(cr.criterion.limit), tc.verifyFalse(cr.evaluated); end
+                end
+                tc.verifyTrue(ismember(r.verdict, [mgtwin.CaseVerdict.INDETERMINATE, mgtwin.CaseVerdict.PASS]));
+            end
+            % Remediated site: PROT-01 unblocks into an INDETERMINATE screening
+            % and the LRG overvoltage exceeds sqrt(3).
+            rep2 = mgtwin.runSuite(build_demo_site(true), suite, "ISL_1");
+            prot2 = rep2.byCaseId("PROT-01");
+            tc.verifyEqual(prot2.status, mgtwin.CaseStatus.EXECUTED);
+            tc.verifyEqual(prot2.verdict, mgtwin.CaseVerdict.INDETERMINATE);
+            tc.verifyGreaterThan(prot2.metric("unfaulted_phase_overvoltage").value, 1.73);
+            % Assumed-parameter PASS carries its condition.
+            limits = dictionary("ISL-P-01/frequency_nadir_deviation", 5.0);
+            rep3 = mgtwin.runSuite(site, suite, "ISL_1", project_limits=limits);
+            isl_p = rep3.byCaseId("ISL-P-01");
+            tc.verifyEqual(isl_p.verdict, mgtwin.CaseVerdict.PASS);
+            tc.verifyEqual(isl_p.provenance, mgtwin.ParamProvenance.ASSUMED);
+            tc.verifySubstring(isl_p.render(), "conditional");
+        end
+
+        % -----------------------------------------------------------------
+        % Rung 4: adversarial identification evals
+        % -----------------------------------------------------------------
+        function test_single_experiment_is_blind_to_amplitude_class_mismatch(tc)
+            % The rung-4 finding, pinned as a fact about the method.
+            r = mgtwin.runOne(mgtwin.scenarioByName("deadband"), 0, "single");
+            tc.verifyEqual(r.cell, "false_confidence");
+        end
+
+        function test_multi_amplitude_catches_deadband_and_saturation(tc)
+            for name = ["deadband", "saturation", "knee_droop"]
+                for seed = [0, 1]
+                    r = mgtwin.runOne(mgtwin.scenarioByName(name), seed, "multi");
+                    tc.verifyTrue(r.verdict.isRefusal(), sprintf("%s seed %d: %s", name, seed, r.verdict.Value));
+                    tc.verifyEqual(r.cell, "true_refusal", sprintf("%s seed %d", name, seed));
+                end
+            end
+        end
+
+        function test_multi_amplitude_keeps_nominal_and_minor_probes_identified(tc)
+            for name = ["nominal", "quantized", "fast_unmodeled"]
+                r = mgtwin.runOne(mgtwin.scenarioByName(name), 0, "multi");
+                tc.verifyEqual(r.verdict, mgtwin.Verdict.IDENTIFIED, name);
+                tc.verifyEqual(r.cell, "true_confidence", name);
+            end
+        end
+
+        function test_shape_class_mismatch_caught_by_both_protocols(tc)
+            for protocol = ["single", "multi"]
+                r = mgtwin.runOne(mgtwin.scenarioByName("ramp_limit"), 0, protocol);
+                tc.verifyTrue(r.verdict.isRefusal(), protocol);
+            end
+        end
+
+        function test_identify_multi_pools_consistent_experiments(tc)
+            C = mgtwin.evalConstants();
+            sc = mgtwin.scenarioByName("nominal");
+            exps = {mgtwin.evalExperiment(sc, 0, sc.step), mgtwin.evalExperiment(sc, 1000, C.SMALL_STEP)};
+            res = mgtwin.identifyMulti(exps, struct("rp_pu", 0.03, "tp_sec", 0.40), ...
+                struct("rp_pu", [0.005, 0.20], "tp_sec", [0.01, 2.0]));
+            tc.verifyEqual(res.verdict, mgtwin.Verdict.IDENTIFIED);
+            tc.verifyNotEmpty(res.theta_pooled);
+            tc.verifyEqual(res.theta_pooled(1), 0.05, "RelTol", 0.02);
+            tc.verifyEqual(res.theta_pooled(2), 0.20, "RelTol", 0.05);
+            tc.verifyLessThan(max(struct2array(res.spread_rel)), 0.03);
+        end
+
+        % -----------------------------------------------------------------
+        % Rung 1 / 3: Banshee (skipped if data absent)
+        % -----------------------------------------------------------------
+        function test_banshee_case_translates_with_expected_shape(tc)
+            tc.assumeBanshee();
+            P = banshee_paths();
+            expected = {"case_banshee_feeder_all_v5.m", 12.825; "case_banshee_feeder_all_v4.m", 0.0};
+            for k = 1:2
+                mpc = mgtwin.loadMatpowerCase(fullfile(P.DATA, "Matpower", expected{k, 1}));
+                tc.verifyEqual(mpc.baseMVA, 20.0);
+                tc.verifyEqual(size(mpc.bus), [40, 13]);
+                tc.verifyEqual(size(mpc.branch, 1), 39);
+                tc.verifyEqual(sum(mpc.bus(:, 3)), expected{k, 2}, "AbsTol", 1e-6);
+                tc.verifyEqual(unique(mpc.bus(:, 10))', [0.208, 0.48, 4.16, 13.8], "RelTol", 1e-9);
+            end
+        end
+
+        function test_banshee_v4_reproduces_published_matpower_currents(tc)
+            tc.assumeBanshee();
+            tc.assumeTrue(exist("runpf", "file") > 0, "MATPOWER (runpf) not on path");
+            P = banshee_paths();
+            [~, cands] = banshee_solve_and_currents(P.CASE_V4);
+            placeholder = ["8-9:from", "8-9:to", "2-6:from", "6-7:from"];
+            T = readtable(P.CSV_PATH, "TextType", "string");
+            checked = 0;
+            for r = 1:height(T)
+                m_a = T.MATPOWER_A(r);
+                if m_a < 400.0, continue; end
+                fdr = str2double(extractBetween(T.METER(r), 3, 3));
+                pool = cands([cands.feeder] == fdr);
+                [~, j] = min(abs([pool.i_a] - m_a));
+                if ismember(pool(j).name, placeholder), continue; end
+                tc.verifyLessThan(abs(pool(j).i_a - m_a) / m_a, 5e-4, T.METER(r));
+                checked = checked + 1;
+            end
+            tc.verifyGreaterThanOrEqual(checked, 4);
+        end
+
+        function test_banshee_composition_is_blocked_for_the_right_reasons(tc)
+            tc.assumeBanshee();
+            P = banshee_paths();
+            if isfile(P.MDL), mdl = P.MDL; else, mdl = string.empty; end
+            site = mgtwin.composeBanshee(P.CASE_V5, relay_dir=P.RELAYS, mdl_path=mdl);
+            tc.verifyEqual(numel(site.buses), 40);
+            tc.verifyEqual(numel(site.loads), 18);
+            tc.verifyEqual(numel(site.relays), 3);
+            rep = mgtwin.runAllGates(site);
+            tc.verifyTrue(rep.failed());
+            fails = rep.bySeverity(mgtwin.Severity.FAIL);
+            gates = unique(string({fails.gate}));
+            tc.verifyTrue(ismember("grounding", gates));
+            tc.verifyTrue(ismember("protection", gates));
+            if isfile(P.MDL)
+                tc.verifyEqual(numel(site.transformers), 22);
+                g_fails = fails(string({fails.gate}) == "grounding");
+                tc.verifyEqual(numel(g_fails), 4);
+                scopes = string({g_fails.scope});
+                tc.verifyTrue(all(contains(scopes, "13.8kV")));
+                tc.verifyEqual(sort(unique(extractBefore(scopes, "/"))), ["ISL_ALL", "ISL_F1", "ISL_F2", "ISL_F3"]);
+            end
+        end
+
+        function test_banshee_transformers_paired_by_impedance(tc)
+            % The .m's transformer branches pair with the .mdl's instances by
+            % impedance, not by order: XTX_3_4 (x 1.96 on 20 MVA) is a 500 kVA
+            % unit. Rebased to its unit's rating every reactance is a
+            % transformer's (the units gate passes); the three branches no
+            % instance matches are named.
+            tc.assumeBanshee();
+            P = banshee_paths();
+            T = mgtwin.transformerPairing(P.CASE_V5, P.MDL);
+            row = T(T.branch == "TX_3_4", :);
+            tc.verifyEqual(row.kva, 500); tc.verifyEqual(row.mismatch, 0);
+            tc.verifyEqual(sort(T.branch(T.mismatch > 0.05))', ["TX_30_40", "TX_50_60", "TX_80_110"]);
+            site = mgtwin.composeBanshee(P.CASE_V5, relay_dir=P.RELAYS, mdl_path=P.MDL);
+            tx = site.transformers(string({site.transformers.id}) == "XTX_3_4");
+            tc.verifyEqual(tx.s_rated_mva, 0.5); tc.verifyEqual(tx.x_pu, 0.049, AbsTol=1e-3);
+            fails = mgtwin.gateUnits(site).bySeverity(mgtwin.Severity.FAIL);
+            tc.verifyFalse(any(contains(string({fails.message}), "reactance")));
+        end
+
+        function test_runner_taxonomy_on_banshee_isl_f1(tc)
+            tc.assumeBanshee();
+            [site, suite, limits] = MgtwinTest.rung3Fixture();
+            rep = mgtwin.runSuite(site, suite, "ISL_F1", project_limits=limits);
+            tc.verifyEqual(rep.byCaseId("ISL-P-01").verdict, mgtwin.CaseVerdict.PASS);
+            tc.verifyEqual(rep.byCaseId("ISL-U-01").verdict, mgtwin.CaseVerdict.FAIL);
+            tc.verifyEqual(rep.byCaseId("SS-01").verdict, mgtwin.CaseVerdict.PASS);
+            tc.verifyEqual(rep.byCaseId("PROT-01").status, mgtwin.CaseStatus.BLOCKED);
+            c = rep.counts();
+            tc.verifyEqual([c.executed, c.blocked, c.deferred], [3, 1, 5]);
+        end
+
+        function test_prot_unblocks_into_screening_after_remediation(tc)
+            tc.assumeBanshee();
+            [site, suite, ~] = MgtwinTest.rung3Fixture();
+            site2 = site;
+            site2.grounding(end+1, 1) = mgtwin.GroundingSource(id="G_ZZ_F1", bus="B2", ...
+                kind=mgtwin.GroundingKind.LOW_RESISTANCE, z0_ohm=12.0, available_when_islanded=true);
+            rep = mgtwin.runSuite(site2, suite, "ISL_F1");
+            prot = rep.byCaseId("PROT-01");
+            tc.verifyEqual(prot.status, mgtwin.CaseStatus.EXECUTED);
+            tc.verifyEqual(prot.verdict, mgtwin.CaseVerdict.INDETERMINATE);
+            tc.verifyGreaterThan(prot.metric("unfaulted_phase_overvoltage").value, 1.73);
+        end
+        % -----------------------------------------------------------------
+        % v0.6.1-v0.6.5: declared IT, forming, energisation, loading, switch states
+        % -----------------------------------------------------------------
+        function test_declared_it_zone_warns_with_detector_requirement_not_fail(tc)
+            % v0.6.1: an ungrounded zone the design DECLARES as an IT system
+            % is a WARN carrying the detector requirement, not a PASS or FAIL.
+            site = MgtwinTest.minimalSite( ...
+                "buses", [mgtwin.Bus(id="MV", v_nom_kv=33.0); mgtwin.Bus(id="LV", v_nom_kv=0.69)], ...
+                "transformers", mgtwin.Transformer(id="TX", hv_bus="MV", lv_bus="LV", s_rated_mva=5.5, ...
+                    hv_kv=33.0, lv_kv=0.69, x_pu=0.06, hv_config=mgtwin.WindingConfig.DELTA, ...
+                    lv_config=mgtwin.WindingConfig.WYE_UNGROUNDED), ...
+                "converters", mgtwin.Converter(id="PCS", bus="LV", s_rated_mva=5.5, ...
+                    control=mgtwin.ConverterControl.GFM_DROOP, params=mgtwin.ConverterParams(p_f_droop_pu=0.04)), ...
+                "grounding", [mgtwin.GroundingSource(id="GT", bus="MV", kind=mgtwin.GroundingKind.LOW_RESISTANCE, ...
+                        z0_ohm=38.0, available_when_islanded=true); ...
+                    mgtwin.GroundingSource(id="IT_LV", bus="LV", kind=mgtwin.GroundingKind.UNGROUNDED, ...
+                        available_when_islanded=true, notes="declared IT, IMD fitted")], ...
+                "islands", mgtwin.IslandConfig(id="I1", grid_connected=false, energized_source_ids="PCS"));
+            rep = mgtwin.gateGrounding(site);
+            zones = rep.findings(contains(string({rep.findings.scope}), "zone"));
+            mv = zones(contains(string({zones.scope}), "33kV"));
+            lv = zones(contains(string({zones.scope}), "0.69kV"));
+            tc.verifyEqual(mv(1).severity, mgtwin.Severity.PASS);
+            tc.verifyEqual(lv(1).severity, mgtwin.Severity.WARN);
+            tc.verifySubstring(lv(1).message, "DECLARED");
+            tc.verifySubstring(lv(1).message, "detector");
+            tc.verifyFalse(rep.failed());
+        end
+
+        function test_forming_gate_fails_section_of_grid_following_only(tc)
+            % v0.6.2: a sectionalised bus whose only sources are
+            % grid-following has no reference and must FAIL.
+            site = MgtwinTest.minimalSite( ...
+                "buses", [mgtwin.Bus(id="A", v_nom_kv=33.0); mgtwin.Bus(id="B", v_nom_kv=33.0)], ...
+                "switches", mgtwin.Switch(id="TIE", from_bus="A", to_bus="B"), ...
+                "converters", [mgtwin.Converter(id="GFM", bus="A", s_rated_mva=5.5, ...
+                        control=mgtwin.ConverterControl.GFM_DROOP, params=mgtwin.ConverterParams(p_f_droop_pu=0.04)); ...
+                    mgtwin.Converter(id="GFL", bus="B", s_rated_mva=2.2, ...
+                        control=mgtwin.ConverterControl.GFL, params=mgtwin.ConverterParams())], ...
+                "islands", [mgtwin.IslandConfig(id="COUPLED", grid_connected=false, energized_source_ids=["GFM", "GFL"]); ...
+                    mgtwin.IslandConfig(id="SPLIT", grid_connected=false, energized_source_ids=["GFM", "GFL"], open_switches="TIE")]);
+            rep = mgtwin.gateForming(site);
+            coupled = MgtwinTest.scoped(rep, "COUPLED");
+            split = MgtwinTest.scoped(rep, "SPLIT");
+            tc.verifyEqual([coupled.severity], mgtwin.Severity.PASS);
+            tc.verifyEqual(sort(arrayfun(@(f) f.severity.Value, split))', ["fail", "pass"]);
+        end
+
+        function test_energisation_fails_whole_section_passes_one_at_a_time(tc)
+            % Five 3 MVA transformers closed together exceed six 5.5 MVA PCS
+            % headroom; one at a time fits.
+            w = MgtwinTest.worstByIsland(mgtwin.gateEnergisation(MgtwinTest.revcExample()));
+            tc.verifyEqual(w("FAST_TRANSFER_WHOLE_SECTION"), "fail");
+            tc.verifyTrue(ismember(w("SLOW_TRANSFER_ONE_GROUP"), ["pass", "warn"]));
+        end
+
+        function test_loading_gate_fails_a_black_start_carrying_the_halls(tc)
+            % Rev C's BLACKSTART_GEN leaves the cord-A hall feeders closed on
+            % the 3 MVA genset: the loading gate FAILs it; its later
+            % black-start states, load breakers open, pass.
+            rep = mgtwin.gateLoading(MgtwinTest.revcExample());
+            w = MgtwinTest.worstByIsland(rep);
+            tc.verifyEqual(w("BLACKSTART_GEN"), "fail");
+            tc.verifyEqual(w("NORMAL"), "pass");
+            tc.verifyEqual(w("BLACKSTART_GEN_FIRST_PCS_TR"), "pass");
+            bs = MgtwinTest.scoped(rep, "BLACKSTART_GEN/");
+            tc.verifyTrue(any(contains(string({bs.message}), "exceeds the rating of every source")));
+        end
+
+        function test_loading_gate_warns_when_storage_carries_the_load(tc)
+            % PCS 1-2 forming BESS-1 with Aux A closed and no SOFC running:
+            % carried, but on the batteries.
+            fs = MgtwinTest.scoped(mgtwin.gateLoading(MgtwinTest.revcExample()), "BLACKSTART_BESS1_SOFC_PAIR/");
+            tc.verifyEqual([fs.severity], mgtwin.Severity.WARN);
+        end
+
+        function test_loading_fails_transformer_feeding_more_than_its_rating(tc)
+            % A 3.5 MVA transformer feeding a 12.5 MW hall cord with no source
+            % behind it: FAIL, in every state that closes the cord's feeder.
+            site = MgtwinTest.revcExample();
+            h = find([site.loads.p_mw] > 5, 1);
+            site.buses(end+1, 1) = mgtwin.Bus(id="HALL_LV", v_nom_kv=0.4);
+            site.transformers(end+1, 1) = mgtwin.Transformer(id="TR_HALL", hv_bus=site.loads(h).bus, ...
+                lv_bus="HALL_LV", s_rated_mva=3.5, hv_kv=33.0, lv_kv=0.4, x_pu=0.08, r_pu=0.006, ...
+                hv_config=mgtwin.WindingConfig.DELTA, lv_config=mgtwin.WindingConfig.WYE_GROUNDED);
+            site.loads(h).bus = "HALL_LV";
+            rep = mgtwin.gateLoading(site);
+            tr = rep.findings(endsWith(string({rep.findings.scope}), "/TR_HALL"));
+            tc.verifyNotEmpty(tr);
+            tc.verifyEqual(unique(arrayfun(@(f) f.severity.Value, tr)), "fail");
+            tc.verifyTrue(any(startsWith(string({tr.scope}), "NORMAL/")));
+        end
+
+        function test_units_gate_fails_transformer_reactance_on_the_system_base(tc)
+            % Transformer.x_pu is on the transformer's own rating; a Site that
+            % gives it on the 50 MVA system base (x 1.0 for 6 % on 3 MVA) is
+            % caught, and one entered on its own rating is not.
+            site = MgtwinTest.revcExample();
+            fs = mgtwin.gateUnits(site).bySeverity(mgtwin.Severity.FAIL);
+            fs = fs(contains(string({fs.message}), "transformer reactance"));
+            tc.verifyNotEmpty(fs);
+            tc.verifySubstring(fs(1).message, "TR_SOFC01 1");
+            for k = 1:numel(site.transformers)
+                site.transformers(k).x_pu = 0.06;
+            end
+            rep = mgtwin.gateUnits(site);
+            tc.verifyFalse(any(contains(string({rep.findings.message}), "transformer reactance")));
+        end
+
+        function test_loading_gate_keeps_normally_open_switches_open(tc)
+            % A normally open tie or alternate leg is open unless the state
+            % closes it, so it does not join the boards it ties; marked
+            % normally closed, it does.
+            site = MgtwinTest.revcExample();
+            ids = site.busIds();
+            found = false;
+            for i = 1:numel(site.islands)
+                root = mgtwin.internal.sections(site, site.islands(i));
+                for k = 1:numel(site.switches)
+                    sw = site.switches(k);
+                    if ~sw.normally_closed && root(ids == sw.from_bus) ~= root(ids == sw.to_bus)
+                        found = true; break;
+                    end
+                end
+                if found, break; end
+            end
+            tc.assertTrue(found);
+            site.switches(k).normally_closed = true;
+            root = mgtwin.internal.sections(site, site.islands(i));
+            tc.verifyEqual(root(ids == sw.from_bus), root(ids == sw.to_bus));
+        end
+
+        function test_a_state_closes_a_normally_open_leg(tc)
+            % Rev C's transfers re-close groups 1-5 onto SOFC-2A through their
+            % normally open second legs: listed in closed_switches, the legs
+            % conduct and the energisation gate weighs the step's inrush. Left
+            % out, the gate says the step energises nothing.
+            site = MgtwinTest.revcExample();
+            i = find(string({site.islands.id}) == "FAST_TRANSFER_WHOLE_SECTION");
+            tc.verifyTrue(ismember("CB_SOFC01_2", site.islands(i).closed_switches));
+            tc.verifyFalse(ismember("CB_SOFC01_2", site.openSwitchIds(site.islands(i))));
+            fast = MgtwinTest.scoped(mgtwin.gateEnergisation(site), "FAST_TRANSFER_WHOLE_SECTION/");
+            tc.verifyNumElements(fast, 1);
+            tc.verifySubstring(fast.message, "5 transformer(s)");
+            tc.verifyEqual(fast.severity, mgtwin.Severity.FAIL);
+            site.islands(i).closed_switches = string.empty(1,0);
+            fast = MgtwinTest.scoped(mgtwin.gateEnergisation(site), "FAST_TRANSFER_WHOLE_SECTION/");
+            tc.verifyNumElements(fast, 5);
+            tc.verifyTrue(all(contains(string({fast.message}), "no energised source reaches")));
+        end
+
+        function test_a_state_cannot_open_and_close_one_switch(tc)
+            root = fileparts(fileparts(mfilename("fullpath")));
+            raw = jsondecode(fileread(fullfile(root, "examples", "c003_revC_site.json")));
+            i = find(cellfun(@(x) string(x.id) == "FAST_TRANSFER_WHOLE_SECTION", raw.islands));
+            raw.islands{i}.open_switches{end+1} = 'CB_SOFC01_2';
+            tc.verifyError(@() mgtwin.siteFromStruct(raw), "mgtwin:ValidationError");
+            try
+                mgtwin.siteFromStruct(raw);
+            catch err
+                tc.verifySubstring(err.message, "both opens and closes");
+            end
+            raw.islands{i}.open_switches(end) = [];
+            raw.islands{i}.closed_switches{end+1} = 'CB_NOPE';
+            try
+                mgtwin.siteFromStruct(raw);
+                tc.verifyFail("an unknown switch in closed_switches was accepted");
+            catch err
+                tc.verifySubstring(err.message, "unknown switch");
+            end
+        end
+
+        function test_revc_example_matches_python_gate_counts(tc)
+            % The Rev C example through all seven gates gives Python v0.6.5's
+            % run_all, gate by gate and severity by severity.
+            rep = mgtwin.runAllGates(MgtwinTest.revcExample());
+            key = string({rep.findings.gate})' + "/" + arrayfun(@(f) f.severity.Value, rep.findings);
+            [u, ~, j] = unique(key);
+            got = dictionary(u, accumarray(j, 1));
+            expected = dictionary( ...
+                ["energisation/fail", "energisation/warn", "forming/pass", "grounding/pass", "honesty/warn", ...
+                 "loading/fail", "loading/pass", "loading/warn", "protection/warn", "units/fail"], ...
+                [3, 1, 15, 279, 78, 2, 10, 4, 1, 1]);
+            tc.verifyEqual(sort(keys(got)), sort(keys(expected)));
+            tc.verifyEqual(got(keys(expected)), values(expected));
+        end
+    end
+end

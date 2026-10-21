@@ -1,0 +1,10 @@
+# MATLAB
+*.asv
+*.mex*
+*.mat
+slprj/
+resources/project/
+*.autosave
+# OS / editors
+.DS_Store
+Thumbs.db
