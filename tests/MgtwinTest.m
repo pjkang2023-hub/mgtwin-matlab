@@ -1193,6 +1193,33 @@ classdef MgtwinTest < matlab.unittest.TestCase
             tc.verifyFalse(mag); tc.verifyFalse(both);
         end
 
+        function test_backup_51_under_unit_protection_short_of_margin_warns(tc)
+            % A 51 set above the load a circuit carries may have no margin over a
+            % converter island's fault current. Where an 87L (or 87B zones on both
+            % sides) covers the breaker's circuit in the state's group, that 51 is
+            % the backup: a WARN pointing at breaker failure. Under its board's 87B
+            % alone it is still the circuit's protection: FAIL.
+            PF = @(varargin) mgtwin.ProtectionFunction(varargin{:});
+            function [fail, warn] = screen(fns)
+                rep = mgtwin.gateProtection(MgtwinTest.twoBessSite(fns));
+                f = rep.bySeverity(mgtwin.Severity.FAIL);
+                w = rep.bySeverity(mgtwin.Severity.WARN);
+                fail = f(arrayfun(@(x) startsWith(x.scope, "I1/R"), f));
+                warn = w(arrayfun(@(x) startsWith(x.message, "backup 51"), w));
+            end
+            hi = PF("ansi", "51", "pickup_a", 600.0);           % two 5 MVA BESS give ~630 A: ratio ~1.05
+            [fail, warn] = screen([hi, PF("ansi", "87L", "zone_buses", ["B1", "B2"])]);
+            tc.verifyEmpty(fail); tc.verifyNotEmpty(warn);
+            tc.verifyTrue(contains(warn(1).message, "87L covers the circuit"));
+            [fail, warn] = screen([hi, PF("ansi", "87B", "zone_buses", "B1"), PF("ansi", "87B", "zone_buses", "B2")]);
+            tc.verifyEmpty(fail); tc.verifyTrue(contains(warn(1).message, "87B covers the circuit"));
+            [fail, warn] = screen([hi, PF("ansi", "87B", "zone_buses", "B1")]);
+            tc.verifyNotEmpty(fail); tc.verifyEmpty(warn);
+            % the unit element must be active in the state's group to make the 51 a backup
+            [fail, warn] = screen([hi, PF("ansi", "87L", "zone_buses", ["B1", "B2"], "groups", "G")]);
+            tc.verifyNotEmpty(fail); tc.verifyEmpty(warn);
+        end
+
         function test_envelope_partial_study_stays_provisional(tc)
             % A study that passed the cables it could compute but not the bus
             % breakers: provisional, naming the gap, even on identified models;

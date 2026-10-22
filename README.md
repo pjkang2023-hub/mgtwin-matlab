@@ -1,6 +1,6 @@
 # mgtwin (MATLAB)
 
-MATLAB port of `mgtwin` v0.6.10 -- staged, gated authoring of microgrid
+MATLAB port of `mgtwin` v0.6.11 -- staged, gated authoring of microgrid
 digital twins. The Python original (pydantic + numpy + scipy) is reproduced
 module for module as a MATLAB package `+mgtwin`; the design decisions,
 gate logic, identification honesty rules, unbalanced solver, fault module,
@@ -64,7 +64,7 @@ examples/                demo, ieee4_rung2, banshee_slg, rung4_identifiability_e
 tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
 ```
 
-## What's new since the v0.6.0 port (Python v0.6.1-v0.6.10)
+## What's new since the v0.6.0 port (Python v0.6.1-v0.6.11)
 
 * **Declared IT grounding (v0.6.1).** A `GroundingSource` of kind
   `UNGROUNDED` is a design declaration, not a zero-sequence source: its zone
@@ -156,6 +156,12 @@ tests/MgtwinTest.m       matlab.unittest port of tests/test_mgtwin.py
   negative one, is refused. Load ids reach `siteFromJson` as `jsondecode`
   field names, so an id that is not a valid MATLAB name would be mangled (the
   C003 ids are valid).
+* **Backup overcurrent under unit protection (v0.6.11).** A 50/51/67
+  short of the dependability margin is a WARN, not a FAIL, when unit
+  elements active in the state's group cover the breaker's circuit (an
+  87L, or 87B zones on both sides): it is that circuit's backup, and the
+  WARN points at breaker failure (50BF). A board's 87B alone still leaves
+  the element the circuit's protection, and a FAIL.
 
 ## Conventions of the port
 

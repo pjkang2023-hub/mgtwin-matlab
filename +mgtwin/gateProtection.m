@@ -13,7 +13,11 @@ function rep = gateProtection(site)
 %     * a closed breaker whose relay has no element active in the group is
 %       unprotected in that state: FAIL;
 %     * every phase overcurrent element with a pickup (50, 51, 67) against
-%       the available fault current, with the dependability margin;
+%       the available fault current, with the dependability margin - FAIL
+%       short of it, unless unit elements active in the group cover the
+%       breaker's circuit: the element is then its backup, and a backup
+%       short of margin is a WARN (breaker failure, 50BF, is the backup
+%       that does not rest on magnitude);
 %     * converter-dominated states: the breakers whose primary protection
 %       rests on magnitude alone (no 21 or 51V element, and no unit element
 %       whose zones cover both sides of the breaker) are named in a WARN;
@@ -110,6 +114,12 @@ for k = 1:numel(site.islands)
             "Declare the settings once the setting study has them (pickup in primary amperes)."));
     end
 
+    swIds = string({site.switches.id});
+    % A unit element protects the breaker's circuit only if its zones take in
+    % both sides of the breaker (a feeder's 87L, a bus section between two
+    % 87B zones) - not a board's 87B on a breaker leaving it.
+    unitCovers = @(r, act) unitZoneCovers(site.switches(swIds == r.switch_id), act, UNIT);
+
     for j = 1:numel(ocElem)
         r = ocRelay(j); e = ocElem(j);
         if e.notes == LEGACY
@@ -118,7 +128,18 @@ for k = 1:numel(site.islands)
             scope = isl.id + "/" + r.id + "/" + e.ansi;
         end
         ratio = total_a / e.pickup_a;
-        if ratio < 1.0
+        act = r.active(group);
+        if ratio < PROTECTION_MARGIN && unitCovers(r, act)
+            ansis = string({act.ansi});
+            units = unique(ansis(ismember(ansis, UNIT)));
+            rep.add(Finding("protection", Severity.WARN, ...
+                sprintf("backup %s at %s A has %.2fx pickup from the island's %s A, below the %gx margin; " + ...
+                "%s covers the circuit and is its primary protection", e.ansi, ...
+                mgtwin.internal.fmtThousands(e.pickup_a), ratio, mgtwin.internal.fmtThousands(total_a), ...
+                PROTECTION_MARGIN, strjoin(units, "/")), scope, ...
+                "Back the unit protection up with breaker failure (50BF) or a duplicated scheme; " + ...
+                "a backup pickup cannot be lowered below the load it must carry."));
+        elseif ratio < 1.0
             rep.add(Finding("protection", Severity.FAIL, ...
                 sprintf("available islanded fault current %s A is below pickup %s A (ratio %.2f); this relay will never operate", ...
                 mgtwin.internal.fmtThousands(total_a), mgtwin.internal.fmtThousands(e.pickup_a), ratio), scope, ...
@@ -139,11 +160,6 @@ for k = 1:numel(site.islands)
     for j = 1:numel(inService)
         if ~isempty(inService(j).active(group)), protectedRelays(end+1) = inService(j); end %#ok<AGROW>
     end
-    swIds = string({site.switches.id});
-    % A unit element protects the breaker's circuit only if its zones take in
-    % both sides of the breaker (a feeder's 87L, a bus section between two
-    % 87B zones) - not a board's 87B on a breaker leaving it.
-    unitCovers = @(r, act) unitZoneCovers(site.switches(swIds == r.switch_id), act, UNIT);
     magnitudeOnly = string.empty(1,0);
     for j = 1:numel(protectedRelays)
         act = protectedRelays(j).active(group);
